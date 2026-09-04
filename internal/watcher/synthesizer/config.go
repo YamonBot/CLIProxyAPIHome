@@ -598,6 +598,7 @@ func buildOpenAICompatibilityModels(models []appconfig.OpenAICompatibilityModel,
 		}
 		out = append(out, &registry.ModelInfo{
 			ID:          modelID,
+			Name:        strings.TrimSpace(model.Name),
 			Object:      "model",
 			Created:     created,
 			OwnedBy:     compatName,
