@@ -26,9 +26,10 @@ func TestGetLogsReturnsDatabaseAppLogs(t *testing.T) {
 	defer cleanup()
 
 	now := time.Date(2026, 5, 29, 1, 2, 3, 0, time.UTC)
+	requestID := "018f3a5b-1234-7abc-def0-12345678abcd"
 	records := []cluster.AppLogRecord{
 		{Timestamp: now.Add(-time.Minute), ClientIP: "10.0.0.6", RequestID: "req-other", HomeIP: "192.0.2.10", Level: "info", Line: "ignored", CreatedAt: now.Add(-time.Minute)},
-		{Timestamp: now, ClientIP: "10.0.0.5", RequestID: "req-1", HomeIP: "192.0.2.10", Level: "warn", Line: "wanted", CreatedAt: now},
+		{Timestamp: now, ClientIP: "10.0.0.5", RequestID: requestID, HomeIP: "192.0.2.10", Level: "warn", Line: "wanted", CreatedAt: now},
 	}
 	if errCreate := db.Create(&records).Error; errCreate != nil {
 		t.Fatalf("create logs: %v", errCreate)
@@ -39,7 +40,7 @@ func TestGetLogsReturnsDatabaseAppLogs(t *testing.T) {
 	engine.GET("/logs", handler.GetLogs)
 
 	resp := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/logs?home_ip=192.0.2.10&request_id=req-1&limit=10", nil)
+	req := httptest.NewRequest(http.MethodGet, "/logs?home_ip=192.0.2.10&request_id="+requestID+"&limit=10", nil)
 	engine.ServeHTTP(resp, req)
 
 	if resp.Code != http.StatusOK {
@@ -64,11 +65,18 @@ func TestGetLogsReturnsDatabaseAppLogs(t *testing.T) {
 	if body.Total != 1 || len(body.Logs) != 1 {
 		t.Fatalf("logs total=%d len=%d, want 1", body.Total, len(body.Logs))
 	}
-	if body.Logs[0].ClientIP != "10.0.0.5" || body.Logs[0].RequestID != "req-1" || body.Logs[0].HomeIP != "192.0.2.10" || body.Logs[0].Level != "warn" || body.Logs[0].Line != "wanted" {
+	if body.Logs[0].ClientIP != "10.0.0.5" || body.Logs[0].RequestID != "5678abcd" || body.Logs[0].HomeIP != "192.0.2.10" || body.Logs[0].Level != "warn" || body.Logs[0].Line != "wanted" {
 		t.Fatalf("unexpected log record: %+v", body.Logs[0])
 	}
 	if body.Limit != 10 || body.Offset != 0 {
 		t.Fatalf("pagination = limit %d offset %d, want 10/0", body.Limit, body.Offset)
+	}
+	var stored cluster.AppLogRecord
+	if errRead := db.First(&stored, records[1].ID).Error; errRead != nil {
+		t.Fatalf("read stored app log: %v", errRead)
+	}
+	if stored.RequestID != requestID {
+		t.Fatalf("stored request_id = %q, want full ID %q", stored.RequestID, requestID)
 	}
 }
 
@@ -200,10 +208,12 @@ func TestRequestIDSearchReturnsDistinctCandidates(t *testing.T) {
 					}
 					var response struct {
 						Logs []struct {
-							RequestID string `json:"request_id"`
+							ID        json.RawMessage `json:"id"`
+							RequestID string          `json:"request_id"`
 						} `json:"logs"`
 						Items []struct {
-							RequestID string `json:"request_id"`
+							ID        json.RawMessage `json:"id"`
+							RequestID string          `json:"request_id"`
 						} `json:"items"`
 						Total int64 `json:"total"`
 					}
@@ -217,15 +227,23 @@ func TestRequestIDSearchReturnsDistinctCandidates(t *testing.T) {
 					if response.Total != tt.wantTotal || len(items) != len(tt.wantIDs) {
 						t.Fatalf("total=%d items=%d, want total=%d items=%d", response.Total, len(items), tt.wantTotal, len(tt.wantIDs))
 					}
-					remaining := make(map[string]bool, len(tt.wantIDs))
+					remaining := make(map[string]int, len(tt.wantIDs))
 					for _, requestID := range tt.wantIDs {
-						remaining[requestID] = true
-					}
-					for _, item := range items {
-						if !remaining[item.RequestID] {
-							t.Fatalf("unexpected or duplicate request_id %q", item.RequestID)
+						if endpoint == "/logs" && len(requestID) > 8 {
+							requestID = requestID[len(requestID)-8:]
 						}
-						delete(remaining, item.RequestID)
+						remaining[requestID]++
+					}
+					seen := make(map[string]bool, len(items))
+					for _, item := range items {
+						if remaining[item.RequestID] == 0 {
+							t.Fatalf("unexpected request_id %q", item.RequestID)
+						}
+						remaining[item.RequestID]--
+						if len(item.ID) == 0 || seen[string(item.ID)] {
+							t.Fatalf("missing or duplicate record id %s", item.ID)
+						}
+						seen[string(item.ID)] = true
 					}
 				})
 			}
@@ -252,8 +270,20 @@ func TestDownloadRequestLogByIDUsesRequestIDOnlyForFileMatch(t *testing.T) {
 	if errWrite := os.WriteFile(filepath.Join("logs", collidingFileName), []byte("another request\n"), 0o644); errWrite != nil {
 		t.Fatalf("write colliding request log: %v", errWrite)
 	}
+	uniqueFileName := "10.0.0.9-v1-responses-2026-05-29T010205-018f3a5b-1234-7abc-def0-1234f0baf00d.log"
+	if errWrite := os.WriteFile(filepath.Join("logs", uniqueFileName), []byte("unique request\n"), 0o644); errWrite != nil {
+		t.Fatalf("write unique request log: %v", errWrite)
+	}
 
 	now := time.Date(2026, 5, 29, 1, 2, 3, 0, time.UTC)
+	// The later filename has an older modification time.
+	if errChtimes := os.Chtimes(filepath.Join("logs", fileName), now, now); errChtimes != nil {
+		t.Fatalf("set request log modification time: %v", errChtimes)
+	}
+	older := now.Add(-time.Minute)
+	if errChtimes := os.Chtimes(filepath.Join("logs", collidingFileName), older, older); errChtimes != nil {
+		t.Fatalf("set colliding log modification time: %v", errChtimes)
+	}
 	record := cluster.AppLogRecord{
 		Timestamp: now,
 		ClientIP:  "10.0.0.5",
@@ -275,9 +305,13 @@ func TestDownloadRequestLogByIDUsesRequestIDOnlyForFileMatch(t *testing.T) {
 		name      string
 		requestID string
 		status    int
+		body      string
 	}{
-		{name: "full UUID", requestID: requestID, status: http.StatusOK},
-		{name: "short ID cannot select a request", requestID: "5678abcd", status: http.StatusNotFound},
+		{name: "full UUID", requestID: requestID, status: http.StatusOK, body: content},
+		{name: "other full UUID with same suffix", requestID: "018f3a5b-5678-7abc-def0-99995678abcd", status: http.StatusOK, body: "another request\n"},
+		{name: "short ID selects most recently modified file", requestID: "5678abcd", status: http.StatusOK, body: content},
+		{name: "unique short ID", requestID: "f0baf00d", status: http.StatusOK, body: "unique request\n"},
+		{name: "missing short ID", requestID: "deadbeef", status: http.StatusNotFound},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := httptest.NewRecorder()
@@ -290,8 +324,8 @@ func TestDownloadRequestLogByIDUsesRequestIDOnlyForFileMatch(t *testing.T) {
 			if tt.status != http.StatusOK {
 				return
 			}
-			if got := resp.Body.String(); got != content {
-				t.Fatalf("body = %q, want %q", got, content)
+			if got := resp.Body.String(); got != tt.body {
+				t.Fatalf("body = %q, want %q", got, tt.body)
 			}
 			if got := resp.Header().Get("Content-Disposition"); got == "" {
 				t.Fatal("Content-Disposition is empty")

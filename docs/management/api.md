@@ -3233,13 +3233,15 @@ Example response:
 
 Returns application log records from the database `log` table.
 
+Each returned `request_id` is the final 8 characters of the stored ID (shorter IDs are unchanged), so existing runtime-log interfaces display the short ID without frontend changes. The database and usage APIs retain the full request ID. Different log records may share the same display ID; use each record's `id` as its row identity.
+
 Query parameters:
 
 | Query | Type | Description |
 | --- | --- | --- |
 | `home_ip` | string | Optional Home node IP filter. |
 | `client_ip` | string | Optional CPA client IP filter. |
-| `request_id` | string | Optional request ID filter. An 8-character value matches the literal suffix; other lengths match exactly. Returns all matching log records with their full `request_id`; `%` and `_` are not wildcards. |
+| `request_id` | string | Optional request ID filter against stored IDs. An 8-character value matches the literal suffix; other lengths match exactly. Returns all matching log records with short display IDs; `%` and `_` are not wildcards. |
 | `level` | string | Optional log level filter. |
 | `after` | integer or RFC3339 | Optional timestamp lower bound. |
 | `before` | integer or RFC3339 | Optional timestamp upper bound. |
@@ -3320,13 +3322,13 @@ Response: file attachment.
 
 Downloads a Home request log file from that Home's local `logs` directory. `home_ip` identifies which Home owns the file, and optional `home_port` disambiguates Home nodes that share the same IP. When the target is not the current Home, the current Home forwards the request to the target Home over an internal mTLS-only cluster route. Files are matched by request ID, and the file system remains the source of truth, so deleted files return `404`.
 
-Storage, correlation, and downloads use the full request ID. Interfaces may display its final 8 characters, but must retain the full value for details, copying, and downloads. To find a request from a short display ID, pass those 8 characters as `request_id` to a list endpoint and select a candidate; this download endpoint always matches the stored ID exactly.
+Storage and usage correlation retain the full request ID. Downloads use `<id>.log` as the literal filename suffix for both full IDs and short display IDs. When multiple files match, Home returns the file with the most recent modification time.
 
 Path parameters:
 
 | Path | Type | Description |
 | --- | --- | --- |
-| `id` | string | Full stored request ID; slashes are rejected. |
+| `id` | string | Full stored request ID or an 8-character display ID; slashes are rejected. |
 
 Query parameters:
 

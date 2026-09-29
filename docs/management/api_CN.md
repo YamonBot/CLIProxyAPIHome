@@ -3232,13 +3232,15 @@ Query 参数：
 
 返回数据库 `log` 表中的应用日志记录。
 
+返回的 `request_id` 为存储 ID 的末 8 位，不足 8 位时保持原样，因此现有运行日志界面无需修改前端即可显示短 ID。数据库和 usage 接口仍保留完整 request ID。不同日志记录可以有相同的显示 ID，列表行应使用各记录的 `id` 区分。
+
 Query 参数：
 
 | Query | 类型 | 说明 |
 | --- | --- | --- |
 | `home_ip` | string | 可选 Home node IP 过滤条件。 |
 | `client_ip` | string | 可选 CPA client IP 过滤条件。 |
-| `request_id` | string | 可选 request ID 筛选。输入 8 位时按字面后缀筛选，其他长度精确匹配。返回所有匹配日志并保留完整 `request_id`；`%` 和 `_` 不作为通配符。 |
+| `request_id` | string | 对存储 ID 的可选筛选。输入 8 位时按字面后缀筛选，其他长度精确匹配。返回所有匹配日志，响应中使用短显示 ID；`%` 和 `_` 不作为通配符。 |
 | `level` | string | 可选日志级别过滤条件。 |
 | `after` | integer 或 RFC3339 | 可选 timestamp 下界。 |
 | `before` | integer 或 RFC3339 | 可选 timestamp 上界。 |
@@ -3319,13 +3321,13 @@ Path 参数：
 
 从对应 Home 本机 `logs` 目录下载 request log 文件。`home_ip` 用来指明文件属于哪台 Home，可选 `home_port` 用于区分共享同一 IP 的多个 Home 节点；当目标不是当前 Home 时，当前 Home 会通过内部 mTLS-only cluster route 转发到目标 Home。文件按 request ID 匹配，文件系统仍是事实来源，所以文件已被删除时返回 `404`。
 
-存储、关联和下载使用完整 request ID。界面可以只显示末 8 位，但查看详情、复制和下载时应使用完整值。根据短 ID 查找请求时，应将这 8 位作为列表接口的 `request_id` 并选择候选记录；下载接口始终精确匹配存储的 ID。
+存储和 usage 关联仍使用完整 request ID。下载时，完整 ID 和短显示 ID 统一以 `<id>.log` 作为文件名的字面后缀匹配。多个文件匹配时，Home 返回修改时间最新的文件。
 
 Path 参数：
 
 | Path | 类型 | 说明 |
 | --- | --- | --- |
-| `id` | string | 存储的完整 request ID；拒绝 slash。 |
+| `id` | string | 存储的完整 request ID 或 8 位显示 ID；拒绝 slash。 |
 
 Query 参数：
 
