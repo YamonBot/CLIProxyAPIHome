@@ -668,6 +668,40 @@ func resolveRuntimeDatabaseBackend(clusterCfg *cluster.Config, clusterExists boo
 	return cluster.DatabaseBackendSQLite
 }
 
+// Bounded retry budget for the Postgres database open path. A CNPG
+// failover or node-pressure restart leaves the rw endpoint briefly
+// unreachable; exiting immediately converts a self-healing blip into a
+// CrashLoopBackOff that empties the 8327 service endpoint and takes
+// every cliproxy replica's readiness with it. SQLite stays fail-fast.
+const (
+	runtimeDatabaseOpenRetryBudget   = 10 * time.Minute
+	runtimeDatabaseOpenRetryInterval = 3 * time.Second
+)
+
+// openPostgresDatabaseWithRetry retries cluster.Open against Postgres for
+// up to runtimeDatabaseOpenRetryBudget, honoring context cancellation.
+func openPostgresDatabaseWithRetry(ctx context.Context, cfg cluster.PGSQLConfig) (*gorm.DB, error) {
+	deadline := time.Now().Add(runtimeDatabaseOpenRetryBudget)
+	for attempt := 1; ; attempt++ {
+		db, errOpen := cluster.Open(ctx, cfg)
+		if errOpen == nil {
+			return db, nil
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("database open retry canceled: %w", errOpen)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("database open retry budget exhausted after %d attempts: %w", attempt, errOpen)
+		}
+		log.Warnf("database open attempt %d failed (retrying for %s): %v", attempt, runtimeDatabaseOpenRetryBudget, errOpen)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("database open retry canceled: %w", errOpen)
+		case <-time.After(runtimeDatabaseOpenRetryInterval):
+		}
+	}
+}
+
 // openRuntimeDatabase opens the database used by the DB-backed runtime.
 func openRuntimeDatabase(ctx context.Context, clusterCfg *cluster.Config, clusterExists bool, sqlitePath string) (*gorm.DB, cluster.DatabaseBackend, error) {
 	if clusterExists {
@@ -679,7 +713,7 @@ func openRuntimeDatabase(ctx context.Context, clusterCfg *cluster.Config, cluste
 			db, errOpenSQLite := cluster.OpenSQLite(ctx, resolveSQLitePath(sqlitePath, clusterCfg.SQLite.Path), clusterCfg.SQLite.SlowQueryThreshold)
 			return db, cluster.DatabaseBackendSQLite, errOpenSQLite
 		case cluster.DatabaseBackendPostgres:
-			db, errOpenPostgres := cluster.Open(ctx, clusterCfg.PGSQL)
+			db, errOpenPostgres := openPostgresDatabaseWithRetry(ctx, clusterCfg.PGSQL)
 			return db, cluster.DatabaseBackendPostgres, errOpenPostgres
 		default:
 			return nil, "", fmt.Errorf("unsupported database backend %q", clusterCfg.DatabaseBackend())
