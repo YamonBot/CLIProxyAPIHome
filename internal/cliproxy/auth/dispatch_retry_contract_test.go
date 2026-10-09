@@ -238,11 +238,13 @@ func TestDispatchRetryRoundCooldownIgnoresExhaustedCredential(t *testing.T) {
 			manager.SetConfig(&internalconfig.Config{RequestRetry: 3})
 			exhausted := dispatchRetryCooldownAuth("retry-round-exhausted-"+test.name, 2)
 			eligible := dispatchRetryCooldownAuth("retry-round-eligible-cooldown-"+test.name, 3)
+			// Keep both cooldowns active through registration and dispatch on a loaded runner.
+			// The eligible 30s window remains distinct from the exhausted 2m window.
 			now := time.Now()
 			exhausted.ModelStates["gpt"].NextRetryAfter = now.Add(2 * time.Minute)
 			exhausted.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(2 * time.Minute)
-			eligible.ModelStates["gpt"].NextRetryAfter = now.Add(10 * time.Millisecond)
-			eligible.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(10 * time.Millisecond)
+			eligible.ModelStates["gpt"].NextRetryAfter = now.Add(30 * time.Second)
+			eligible.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(30 * time.Second)
 			registerDispatchTestAuth(t, manager, exhausted, "gpt")
 			registerDispatchTestAuth(t, manager, eligible, "gpt")
 
@@ -253,7 +255,7 @@ func TestDispatchRetryRoundCooldownIgnoresExhaustedCredential(t *testing.T) {
 			if !errors.As(errDispatch, &cooldownErr) || cooldownErr == nil {
 				t.Fatalf("Dispatch() error = %T %v, want model cooldown", errDispatch, errDispatch)
 			}
-			if retryAfter := cooldownErr.RetryAfter(); retryAfter == nil || *retryAfter > time.Second {
+			if retryAfter := cooldownErr.RetryAfter(); retryAfter == nil || *retryAfter <= 0 || *retryAfter > 30*time.Second {
 				t.Fatalf("RetryAfter() = %v, want only the eligible credential's short cooldown", retryAfter)
 			}
 			if retryLimit, ok := cooldownErr.RequestRetryLimit(); !ok || retryLimit != 3 {
