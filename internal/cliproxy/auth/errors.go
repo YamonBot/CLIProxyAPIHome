@@ -1,9 +1,29 @@
 package auth
 
+import (
+	"net/http"
+	"strings"
+)
+
 // UpstreamResponse contains the exact HTTP response returned by a provider.
 type UpstreamResponse struct {
 	Status int    `json:"status"`
 	Body   []byte `json:"body"`
+}
+
+// IsOAuthInvalidatedError reports an upstream statement that the OAuth
+// session itself was invalidated (for example the codex
+// "Encountered invalidated oauth token for user" bearer rejection).
+// Token refresh can keep succeeding while the session is invalidated, so
+// only request-time evidence can detect this state.
+func IsOAuthInvalidatedError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Message, "invalidated oauth token") {
+		return true
+	}
+	return err.Code == "auth_unavailable" && err.HTTPStatus == http.StatusUnauthorized
 }
 
 // Error describes an authentication related failure in a provider agnostic format.
