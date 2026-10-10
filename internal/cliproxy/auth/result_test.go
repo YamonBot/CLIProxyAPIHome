@@ -391,3 +391,88 @@ func TestAuthRefreshBackoffDoesNotBlockModels(t *testing.T) {
 		t.Fatalf("isAuthBlockedForModel() = %v, %v, %v; want dispatchable", blocked, reason, next)
 	}
 }
+
+func TestOAuthInvalidatedRequestBenchesWholeCredential(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auth-oauth-invalidated",
+		Provider: "codex",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"gpt-6-sol": {Status: StatusActive},
+			"gpt-5.5":   {Status: StatusActive},
+		},
+	}
+	err := &Error{
+		Code:        "auth_unavailable",
+		Message:     "Encountered invalidated oauth token for user, failing request",
+		HTTPStatus:  http.StatusUnauthorized,
+	}
+	NewManager(nil, nil, nil).applyResultTransition(auth, Result{
+		AuthID:  auth.ID,
+		Model:   "gpt-6-sol",
+		Success: false,
+		Error:   err,
+	}, "gpt-6-sol", now, false)
+
+	for model, state := range auth.ModelStates {
+		if !state.Unavailable {
+			t.Fatalf("model %s not benched for invalidated oauth session: %#v", model, state)
+		}
+		if state.NextRetryAfter.Before(now.Add(oauthInvalidatedRetryBackoff - time.Second)) {
+			t.Fatalf("model %s retry window too short: %v", model, state.NextRetryAfter)
+		}
+	}
+	if !auth.Unavailable || auth.NextRetryAfter.Before(now.Add(unauthorizedRetryBackoff)) {
+		t.Fatalf("credential-level availability not aggregated from benched models: %#v", auth)
+	}
+	blocked, reason, _ := isAuthBlockedForModel(auth, "gpt-5.5", now)
+	if !blocked || reason == blockReasonNone {
+		t.Fatalf("selector still dispatches benched credential: blocked=%v reason=%v", blocked, reason)
+	}
+}
+
+func TestPlainUnauthorizedKeepsOtherModelsDispatchable(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auth-plain-unauthorized",
+		Provider: "codex",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"gpt-6-sol": {Status: StatusActive},
+			"gpt-5.5":   {Status: StatusActive},
+		},
+	}
+	NewManager(nil, nil, nil).applyResultTransition(auth, Result{
+		AuthID:  auth.ID,
+		Model:   "gpt-6-sol",
+		Success: false,
+		Error:   &Error{Message: "invalid request signature", HTTPStatus: http.StatusUnauthorized},
+	}, "gpt-6-sol", now, false)
+
+	if state := auth.ModelStates["gpt-5.5"]; state.Unavailable {
+		t.Fatalf("unrelated model benched by plain unauthorized: %#v", state)
+	}
+	blocked, _, _ := isAuthBlockedForModel(auth, "gpt-5.5", now)
+	if blocked {
+		t.Fatal("unrelated model blocked by plain unauthorized result")
+	}
+}
+
+func TestIsOAuthInvalidatedError(t *testing.T) {
+	if IsOAuthInvalidatedError(nil) {
+		t.Fatal("nil error classified as invalidated")
+	}
+	if !IsOAuthInvalidatedError(&Error{Message: "Encountered invalidated oauth token for user"}) {
+		t.Fatal("message signal not detected")
+	}
+	if !IsOAuthInvalidatedError(&Error{Code: "auth_unavailable", HTTPStatus: http.StatusUnauthorized}) {
+		t.Fatal("code+status signal not detected")
+	}
+	if IsOAuthInvalidatedError(&Error{Code: "auth_unavailable"}) {
+		t.Fatal("code without 401 misclassified")
+	}
+	if IsOAuthInvalidatedError(&Error{Message: "rate limited", HTTPStatus: http.StatusUnauthorized}) {
+		t.Fatal("unrelated 401 misclassified")
+	}
+}
