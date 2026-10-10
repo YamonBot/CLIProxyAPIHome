@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	quotaBackoffBase            = time.Second
-	quotaBackoffMax             = 30 * time.Minute
-	unauthorizedRetryBackoff    = time.Minute
-	quotaScopeModel             = "model"
-	providerQuotaHintMaxHorizon = 60 * 24 * time.Hour
+	quotaBackoffBase             = time.Second
+	quotaBackoffMax              = 30 * time.Minute
+	unauthorizedRetryBackoff     = time.Minute
+	oauthInvalidatedRetryBackoff = 15 * time.Minute
+	quotaScopeModel              = "model"
+	providerQuotaHintMaxHorizon  = 60 * 24 * time.Hour
 )
 
 // Result captures an upstream execution result reported by a downstream CPA node.
@@ -231,6 +232,24 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		switch statusCode {
 		case http.StatusUnauthorized:
 			state.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
+			if IsOAuthInvalidatedError(result.Error) {
+				// Session-level invalidation outlives the one-minute model
+				// retry window and the token refresh can keep succeeding, so
+				// the request path must bench the whole credential: mark every
+				// model state unavailable so the selector holds the auth out of
+				// dispatch and updateAggregatedAvailability derives the
+				// credential-level cooldown. A later probe or a successful
+				// request clears the bench per state.
+				for _, st := range auth.ModelStates {
+					if st == nil {
+						continue
+					}
+					st.Unavailable = true
+					st.Status = StatusError
+					st.UpdatedAt = now
+					st.NextRetryAfter = now.Add(oauthInvalidatedRetryBackoff)
+				}
+			}
 		case http.StatusPaymentRequired, http.StatusForbidden:
 			if disableCooling {
 				state.NextRetryAfter = time.Time{}
