@@ -9,6 +9,7 @@ import (
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/diff"
 )
@@ -16,7 +17,7 @@ import (
 const homeConfigModelsMetadataKey = "home_config_models"
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
-// It handles Gemini, Interactions, Claude, Codex, xAI, OpenAI-compat, and Vertex-compat providers.
+// It handles Gemini, Interactions, Claude, Codex, xAI, Meta, OpenAI-compat, and Vertex-compat providers.
 type ConfigSynthesizer struct{}
 
 // NewConfigSynthesizer creates a new ConfigSynthesizer instance.
@@ -41,6 +42,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
 	// xAI API Keys
 	out = append(out, s.synthesizeXAIKeys(ctx)...)
+	// Meta API Keys
+	out = append(out, s.synthesizeMetaKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
@@ -127,6 +130,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 			attrs["api_key"] = key
 		}
 		metadata := map[string]any{}
+		addV8CredentialOptions(entry, attrs, metadata)
 		if entry.DisableCooling != nil {
 			metadata["disable_cooling"] = *entry.DisableCooling
 		}
@@ -186,6 +190,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			"api_key": key,
 		}
 		metadata := map[string]any{}
+		addV8CredentialOptions(ck, attrs, metadata)
 		if ck.DisableCooling != nil {
 			metadata["disable_cooling"] = *ck.DisableCooling
 		}
@@ -234,6 +239,11 @@ func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.XAIKey, "xai")
 }
 
+// synthesizeMetaKeys creates Auth entries for Meta API keys.
+func (s *ConfigSynthesizer) synthesizeMetaKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.MetaKey, "meta")
+}
+
 func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entries []appconfig.CodexKey, provider string) []*coreauth.Auth {
 	cfg := ctx.Config
 	now := ctx.Now
@@ -254,6 +264,7 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 			"api_key": key,
 		}
 		metadata := map[string]any{}
+		addV8CredentialOptions(entry, attrs, metadata)
 		if entry.DisableCooling != nil {
 			metadata["disable_cooling"] = *entry.DisableCooling
 		}
@@ -266,6 +277,18 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		}
 		models := buildConfigModels(entry.Models, modelOwner, modelType, now)
 		if provider == "codex" {
+			for _, configured := range entry.Models {
+				alias := strings.TrimSpace(configured.Alias)
+				if alias == "" {
+					alias = strings.TrimSpace(configured.Name)
+				}
+				for _, model := range models {
+					if strings.EqualFold(model.ID, alias) {
+						model.SupportConfigurationUpdate = configured.SupportConfigurationUpdate
+						break
+					}
+				}
+			}
 			models = registry.WithCodexBuiltins(models)
 		}
 		addConfigModelsToMetadata(metadata, models)
@@ -343,6 +366,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
+			addV8CredentialOptions(compat, attrs, metadata)
+			addV8CredentialOptions(entry, attrs, metadata)
 			if disableCooling != nil {
 				metadata["disable_cooling"] = *disableCooling
 			}
@@ -388,6 +413,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
+			addV8CredentialOptions(compat, attrs, metadata)
 			if disableCooling != nil {
 				metadata["disable_cooling"] = *disableCooling
 			}
@@ -445,6 +471,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			"provider_key": providerName,
 		}
 		metadata := map[string]any{}
+		addV8CredentialOptions(compat, attrs, metadata)
 		if compat.DisableCooling != nil {
 			metadata["disable_cooling"] = *compat.DisableCooling
 		}
@@ -554,6 +581,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string, now 
 				info.Thinking = upstream.Thinking
 			}
 		}
+		modelconfig.ApplyConfiguredCapabilities(info, model)
 		out = append(out, info)
 	}
 	return out
@@ -585,11 +613,11 @@ func buildOpenAICompatibilityModels(models []appconfig.OpenAICompatibilityModel,
 			continue
 		}
 		seen[key] = struct{}{}
-		thinking := model.Thinking
-		if thinking == nil {
+		thinking := modelconfig.NormalizeThinkingSupport(model.Thinking)
+		if thinking == nil && !model.Image {
 			thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
-		out = append(out, &registry.ModelInfo{
+		info := &registry.ModelInfo{
 			ID:          modelID,
 			Name:        strings.TrimSpace(model.Name),
 			Object:      "model",
@@ -599,7 +627,20 @@ func buildOpenAICompatibilityModels(models []appconfig.OpenAICompatibilityModel,
 			DisplayName: modelID,
 			UserDefined: true,
 			Thinking:    thinking,
-		})
+		}
+		modelconfig.ApplyConfiguredCapabilities(info, model)
+		info.ConfigDisplayName = strings.TrimSpace(model.DisplayName)
+		if info.ConfigDisplayName != "" {
+			info.DisplayName = info.ConfigDisplayName
+		}
+		info.ForceMapping = model.ForceMapping
+		info.Name = strings.TrimSpace(model.Name)
+		info.SupportedInputModalities = append([]string(nil), model.InputModalities...)
+		info.SupportedOutputModalities = append([]string(nil), model.OutputModalities...)
+		if model.Image {
+			info.Type = "openai-image"
+		}
+		out = append(out, info)
 	}
 	return out
 }

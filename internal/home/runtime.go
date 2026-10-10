@@ -15,8 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	configaccess "github.com/router-for-me/CLIProxyAPIHome/internal/access/config_access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
@@ -338,6 +338,7 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	}
 
 	registry.StartModelsUpdater(runCtx)
+	registry.StartDevinModelsUpdater(runCtx)
 	r.registerModelRefreshCallback()
 	managementasset.SetCurrentConfig(r.cfg)
 	managementasset.StartAutoUpdater(context.Background(), configPath)
@@ -845,6 +846,7 @@ type DispatchResult struct {
 	RequestRetry  int
 	ForceMapping  bool
 	OriginalAlias string
+	ModelInfo     *DispatchModelInfo
 
 	AuthID   string
 	Provider string
@@ -854,6 +856,20 @@ type DispatchResult struct {
 	UnaccountedReply      []byte
 	AccountedReply        []byte
 	AdmissionFenceFailure error
+}
+
+// DispatchModelInfo carries the selected model capabilities needed by CPA at execution time.
+type DispatchModelInfo struct {
+	ID                         string                       `json:"id"`
+	Type                       string                       `json:"type,omitempty"`
+	InputTokenLimit            int                          `json:"inputTokenLimit,omitempty"`
+	OutputTokenLimit           int                          `json:"outputTokenLimit,omitempty"`
+	ContextLength              int                          `json:"context_length,omitempty"`
+	MaxCompletionTokens        int                          `json:"max_completion_tokens,omitempty"`
+	Thinking                   *registry.ThinkingSupport    `json:"thinking,omitempty"`
+	NativeCapabilities         *registry.NativeCapabilities `json:"native_capabilities,omitempty"`
+	SupportConfigurationUpdate bool                         `json:"support_configuration_update"`
+	UserDefined                bool                         `json:"user_defined"`
 }
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
@@ -978,7 +994,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
 			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
-			AuthID: auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
+			ModelInfo: dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel),
+			AuthID:    auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
 			Concurrency: ConcurrencyAdmissionResult{CredentialID: auth.ID, Model: concurrencyModel},
 		}
 		if concurrencyCtx.PrepareResponse != nil {

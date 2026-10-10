@@ -13,6 +13,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// NativeCapabilities preserves tri-state capabilities from the model catalog.
+type NativeCapabilities struct {
+	WebSearch *bool `json:"web_search,omitempty"`
+}
+
 // ModelInfo represents information about an available model
 type ModelInfo struct {
 	// ID is the unique identifier for the model
@@ -55,6 +60,12 @@ type ModelInfo struct {
 	// Thinking holds provider-specific reasoning/thinking budget capabilities.
 	// This is optional and currently used for Gemini thinking budget normalization.
 	Thinking *ThinkingSupport `json:"thinking,omitempty"`
+
+	// NativeCapabilities is forwarded to CPA for the selected dispatch route.
+	NativeCapabilities *NativeCapabilities `json:"native_capabilities,omitempty"`
+
+	// SupportConfigurationUpdate controls Responses input configuration updates.
+	SupportConfigurationUpdate bool `json:"support_configuration_update,omitempty"`
 
 	// UserDefined indicates this model was defined through config file's models[]
 	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
@@ -456,6 +467,14 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 		return nil
 	}
 	copyModel := *model
+	if model.NativeCapabilities != nil {
+		capabilities := *model.NativeCapabilities
+		if capabilities.WebSearch != nil {
+			webSearch := *capabilities.WebSearch
+			capabilities.WebSearch = &webSearch
+		}
+		copyModel.NativeCapabilities = &capabilities
+	}
 	if len(model.SupportedGenerationMethods) > 0 {
 		copyModel.SupportedGenerationMethods = append([]string(nil), model.SupportedGenerationMethods...)
 	}
@@ -838,4 +857,26 @@ func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 		}
 	}
 	return result
+}
+
+// GetModelInfoForClient returns one client-specific model definition.
+func (r *ModelRegistry) GetModelInfoForClient(clientID, modelID string) *ModelInfo {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return nil
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	clientInfos := r.clientModelInfos[clientID]
+	if info := clientInfos[modelID]; info != nil {
+		return cloneModelInfo(info)
+	}
+	for id, info := range clientInfos {
+		if info != nil && strings.EqualFold(id, modelID) {
+			return cloneModelInfo(info)
+		}
+	}
+	return nil
 }

@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	cpasdkapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
-	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	cpacoreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cpaconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	cpasdkapi "github.com/router-for-me/CLIProxyAPI/v8/sdk/api"
+	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	cpacoreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	clustermanagement "github.com/router-for-me/CLIProxyAPIHome/internal/cluster/management"
@@ -223,6 +223,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPost, "/quota/collect", handler.CollectQuota)
 	r.Set(http.MethodGet, "/usage/overview", handler.GetUsageOverview)
 	r.Set(http.MethodGet, "/usage/records", handler.ListUsageRecords)
+	r.Set(http.MethodGet, "/usage/session-tree", handler.GetSessionTree)
 	r.Set(http.MethodGet, "/usage/records/:id", handler.GetUsageRecord)
 	r.Set(http.MethodGet, "/usage/aggregates", handler.ListUsageAggregates)
 	r.Set(http.MethodGet, "/usage/export", handler.ExportUsageRecords)
@@ -327,6 +328,10 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPut, "/xai-api-key", handler.PutXAIKeys)
 	r.Set(http.MethodPatch, "/xai-api-key", handler.PatchXAIKey)
 	r.Set(http.MethodDelete, "/xai-api-key", handler.DeleteXAIKey)
+	r.Set(http.MethodGet, "/meta-api-key", handler.GetMetaKeys)
+	r.Set(http.MethodPut, "/meta-api-key", handler.PutMetaKeys)
+	r.Set(http.MethodPatch, "/meta-api-key", handler.PatchMetaKey)
+	r.Set(http.MethodDelete, "/meta-api-key", handler.DeleteMetaKey)
 	r.Set(http.MethodGet, "/claude-api-key", handler.GetClaudeKeys)
 	r.Set(http.MethodPut, "/claude-api-key", handler.PutClaudeKeys)
 	r.Set(http.MethodPatch, "/claude-api-key", handler.PatchClaudeKey)
@@ -367,6 +372,8 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodGet, "/codex-auth-url", handler.RequestCodexToken)
 	r.Set(http.MethodGet, "/kimi-auth-url", handler.RequestKimiToken)
 	r.Set(http.MethodGet, "/xai-auth-url", handler.RequestXAIToken)
+	r.Set(http.MethodGet, "/devin-auth-url", handler.RequestDevinToken)
+	r.Set(http.MethodGet, "/meta-auth-url", handler.RequestMetaToken)
 	r.Set(http.MethodGet, "/get-auth-status", handler.GetAuthStatus)
 	r.Set(http.MethodPost, "/vertex/import", handler.ImportVertexCredential)
 	r.Set(http.MethodPost, "/api-call", handler.APICall)
@@ -633,6 +640,7 @@ func Build(configFilePath string, opts ...RouteOption) (*BuildResult, error) {
 		clusterHandler = clustermanagement.NewHandler(clusterOpt.Repository, clusterOpt.Runtime, clusterOpt.NodeIP, clusterOpt.NodePort)
 		clusterHandler.SetHeartbeatTimeout(clusterOpt.HeartbeatTimeout)
 		clusterHandler.SetForwardTLSConfig(clusterOpt.ForwardTLSConfig)
+		clusterHandler.SetQuotaRecollectTrigger(clusterOpt.QuotaRecollect)
 		clusterGroup := engine.Group("/v0/cluster")
 		clusterGroup.Use(withBuildInfoHeaders(), clusterMTLSMiddleware())
 		registerClusterInternalRoutes(clusterGroup, clusterHandler)
@@ -667,6 +675,24 @@ func Build(configFilePath string, opts ...RouteOption) (*BuildResult, error) {
 		)
 	}
 	reg.Register(mgmt)
+	v8 := engine.Group("/v8/management")
+	v8.Use(mgmt.Handlers[len(engine.Handlers):]...)
+	if !clusterEnabled {
+		v8.Use(func(c *gin.Context) { c.Set("management.config-v8", true) })
+	}
+	managementV8Routes(reg, handler, clusterHandler).Register(v8)
+	// OAuth callbacks authenticate with their pending state, as in CPA V8.
+	callback := engine.Group("/v8/management/oauth")
+	callback.Use(withBuildInfoHeaders())
+	if clusterEnabled {
+		callback.Use(clusterAvailabilityMiddleware(clusterOpt, handler))
+		callback.GET("/callback", clusterHandler.PostOAuthCallback)
+		callback.POST("/callback", clusterHandler.PostOAuthCallback)
+	} else {
+		callback.Use(refreshAndAvailabilityMiddleware(configFilePath, handler, authManager, tokenStore))
+		callback.GET("/callback", handler.GetOAuthCallback)
+		callback.POST("/callback", handler.PostOAuthCallback)
+	}
 	if clusterEnabled && clusterHandler != nil {
 		engine.NoRoute(clusterManagementNoRoute(clusterOpt, handler, clusterHandler))
 	}

@@ -124,7 +124,7 @@ func respondConfigWriteError(c *gin.Context, err error) {
 }
 
 func hasCredentialConfigRoots(root map[string]any) bool {
-	for _, key := range []string{"gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility"} {
+	for _, key := range []string{"gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "meta-api-key", "claude-api-key", "openai-compatibility"} {
 		if _, exists := root[key]; exists {
 			return true
 		}
@@ -166,6 +166,12 @@ func (h *Handler) PutConfigRoot(route string) gin.HandlerFunc {
 			return
 		}
 		root[key] = value
+		if oauth, changed, errScope := appconfig.UpdateOAuthScope(root["oauth"], key, value); errScope != nil {
+			respondError(c, http.StatusUnprocessableEntity, "invalid_config", errScope)
+			return
+		} else if changed {
+			root["oauth"] = oauth
+		}
 		if _, errConfig := configFromRoot(root); errConfig != nil {
 			respondError(c, http.StatusUnprocessableEntity, "invalid_config", errConfig)
 			return
@@ -206,6 +212,12 @@ func (h *Handler) PatchConfigRoot(route string) gin.HandlerFunc {
 		} else {
 			root[key] = mergeConfigPatch(current, patch)
 		}
+		if oauth, changed, errScope := appconfig.UpdateOAuthScope(root["oauth"], key, root[key]); errScope != nil {
+			respondError(c, http.StatusUnprocessableEntity, "invalid_config", errScope)
+			return
+		} else if changed {
+			root["oauth"] = oauth
+		}
 		if _, errConfig := configFromRoot(root); errConfig != nil {
 			respondError(c, http.StatusUnprocessableEntity, "invalid_config", errConfig)
 			return
@@ -235,6 +247,12 @@ func (h *Handler) DeleteConfigRoot(route string) gin.HandlerFunc {
 			return
 		}
 		delete(root, key)
+		if oauth, changed, errScope := appconfig.UpdateOAuthScope(root["oauth"], key, nil); errScope != nil {
+			respondError(c, http.StatusBadRequest, "invalid_config", errScope)
+			return
+		} else if changed {
+			root["oauth"] = oauth
+		}
 		if _, errConfig := configFromRoot(root); errConfig != nil {
 			respondError(c, http.StatusUnprocessableEntity, "invalid_config", errConfig)
 			return
@@ -300,7 +318,7 @@ func rawConfigRootFromYAML(data []byte) (map[string]any, error) {
 	if root == nil {
 		root = make(map[string]any)
 	}
-	return root, nil
+	return appconfig.NormalizeConfigRoot(root)
 }
 
 // configRootFromYAML derives config root from yaml.
@@ -391,7 +409,7 @@ func mergeConfigPatch(current map[string]any, patch map[string]any) map[string]a
 // isCredentialConfigKey reports whether credential config key.
 func isCredentialConfigKey(key string) bool {
 	switch strings.TrimSpace(key) {
-	case "auth-dir", "gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
+	case "auth-dir", "gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "meta-api-key", "claude-api-key", "openai-compatibility":
 		return true
 	default:
 		return false

@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	cpasdkapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
-	cpacoreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cpaconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	cpasdkapi "github.com/router-for-me/CLIProxyAPI/v8/sdk/api"
+	cpacoreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	clustermanagement "github.com/router-for-me/CLIProxyAPIHome/internal/cluster/management"
 )
 
@@ -120,6 +120,12 @@ func TestClusterManagementAPIKeyUsageRouteRegistered(t *testing.T) {
 		{Method: http.MethodPut, Path: "/xai-api-key"},
 		{Method: http.MethodPatch, Path: "/xai-api-key"},
 		{Method: http.MethodDelete, Path: "/xai-api-key"},
+		{Method: http.MethodGet, Path: "/meta-api-key"},
+		{Method: http.MethodPut, Path: "/meta-api-key"},
+		{Method: http.MethodPatch, Path: "/meta-api-key"},
+		{Method: http.MethodDelete, Path: "/meta-api-key"},
+		{Method: http.MethodGet, Path: "/devin-auth-url"},
+		{Method: http.MethodGet, Path: "/meta-auth-url"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)

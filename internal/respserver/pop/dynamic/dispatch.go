@@ -165,6 +165,11 @@ func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]
 				return nil, errSet
 			}
 		}
+		if result.ModelInfo != nil {
+			if errSet := set("model_info", result.ModelInfo); errSet != nil {
+				return nil, errSet
+			}
+		}
 		if errSet := set("auth_index", authIndex); errSet != nil {
 			return nil, errSet
 		}
@@ -245,9 +250,13 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	}
 
 	headers := parseHeaders(jsonArg)
-	sessionID := strings.TrimSpace(gjson.Get(jsonArg, "session_id").String())
+	sessionID := coreauth.NormalizeExplicitID(gjson.Get(jsonArg, "session_id").String())
 	if sessionID != "" && strings.TrimSpace(headers.Get("X-Session-ID")) == "" {
 		headers.Set("X-Session-ID", sessionID)
+	}
+	parentSessionID := coreauth.NormalizeExplicitID(gjson.Get(jsonArg, "parent_session_id").String())
+	if parentSessionID != "" && strings.TrimSpace(headers.Get("X-Parent-Session-ID")) == "" {
+		headers.Set("X-Parent-Session-ID", parentSessionID)
 	}
 	authRes, authErr := env.Runtime.Authenticate(ctx, headers)
 	if authErr != nil {
