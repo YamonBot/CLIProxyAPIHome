@@ -353,6 +353,14 @@ The read-only paths are `credentials/concurrency/lifecycle-config-revision`, `cr
 
 Home normalizes `observability.usage.usage-statistics-enabled` to `true` and `oauth.providers.aistudio.ws-auth` to `false`. `routing.cooldown.disable-cooling` remains Home's local scheduling policy; downstream CPA configuration independently forces local CPA cooling off. `server.port` configures CPA, and running CPA processes need a restart to rebind; Home's listener still uses `-addr` or `cluster.yaml` / `node.port`. `oauth.auth-dir` remains an import/export path, not a runtime file-write destination.
 
+### Model Catalog Sources
+
+The `models` subtree is persisted in the database config snapshot as a `config` table row with key `models` and a JSON object value. Set it through the Management API or import it from `config.yaml` with `-import`; Home reads it from the database at runtime. `config.yaml` is only an import/export exchange format, so editing the file alone does not update a running Home.
+
+The `models` configuration subtree accepts `catalog`, `codex-catalog`, and `devin-catalog`. Each value must be an HTTP(S) URL or an absolute local file path; an empty value keeps the embedded fallback and official remote refresh. Sources refresh every 3 hours and on source changes. Failed refreshes retain the last valid catalog, and custom sources never fall back to official URLs.
+
+All three catalogs are loaded by Home. The complete `models` subtree is also distributed to CPA nodes, where `codex-catalog` selects the Codex client catalog. Home-mode CPA nodes obtain their general and Devin model lists from Home and ignore their `catalog` and `devin-catalog` sources. Update these fields through the existing v8 config or config-subtree endpoints (for example, `/config/models`).
+
 ### Payload and OAuth Provider Subtrees
 
 Use `/config/requests/payload` for payload rules and `/config/oauth/providers/antigravity` for Antigravity OAuth options. Both follow the tree rules above, including raw responses, recursive object patching, whole-list replacement, and retained `null` values.
@@ -3970,7 +3978,7 @@ Response:
 
 `PUT /config/oauth/excluded-models/claude` accepts a raw string array. `DELETE /config/oauth/excluded-models/claude` removes only that provider; deleting `/config/oauth/excluded-models` removes the whole map. These rules apply to OAuth/file credentials; upstream API-key groups use their own `excluded-models`. A credential with its own non-empty `excluded_models` uses that list instead of these global rules; every other credential picks up changes here on the next config reload without rewriting credentials.
 
-Upgrade note: earlier Home versions merged these global rules into each OAuth credential when it was saved. The database version 7 startup migration rebuilds every OAuth credential's stored exclusions from its own `excluded_models`, removing those merged copies. This upgrade requires downtime: stop every older Home node before starting the new version, and do not run older and newer nodes against the same database at the same time. A still-running older node can write the merged copies back, and PostgreSQL does not rerun the migration afterwards.
+Upgrade note: earlier Home versions merged these global rules into each OAuth credential when it was saved. The database version 7 startup migration rebuilds every OAuth credential's stored exclusions from its own `excluded_models`, removing those merged copies. Invalid stored `excluded_models` values do not block the migration: as with runtime loading, valid rules are kept and invalid entries are ignored with a warning. This upgrade requires downtime: stop every older Home node before starting the new version, and do not run older and newer nodes against the same database at the same time. A still-running older node can write the merged copies back, and PostgreSQL does not rerun the migration afterwards.
 
 ### `/config/oauth/model-alias`
 
