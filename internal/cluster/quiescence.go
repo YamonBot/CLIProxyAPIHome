@@ -391,7 +391,7 @@ func (r *Repository) RefreshCPALiveness(ctx context.Context, lifetime Connection
 		if membership.State != MembershipStateActive || !membership.ConnectedAt.Equal(lifetime.ConnectedAt) || !membershipOwnedByHome(membership, lifetime.Home) {
 			return ErrMembershipNotActive
 		}
-		if errHome := verifyActiveHomeIncarnation(tx, lifetime.Home); errHome != nil {
+		if errHome := verifyActiveHomeIncarnationWithLock(tx, lifetime.Home, "SHARE"); errHome != nil {
 			return errHome
 		}
 		now, errNow := DatabaseNow(ctx, tx)
@@ -523,8 +523,13 @@ func lifecycleConfigForQuiescence(tx *gorm.DB) (LifecycleConfigRecord, error) {
 }
 
 func verifyActiveHomeIncarnation(tx *gorm.DB, home HomeIncarnationID) error {
+	return verifyActiveHomeIncarnationWithLock(tx, home, "UPDATE")
+}
+
+func verifyActiveHomeIncarnationWithLock(tx *gorm.DB, home HomeIncarnationID, strength string) error {
+	// Heartbeat readers may coexist; state changes and snapshot replacement retain exclusive locks.
 	record := HomeProcessIncarnationRecord{}
-	errFirst := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(home.IP), home.Port, home.StartedAt).Error
+	errFirst := tx.Clauses(clause.Locking{Strength: strength}).First(&record, "home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(home.IP), home.Port, home.StartedAt).Error
 	if errors.Is(errFirst, gorm.ErrRecordNotFound) {
 		return ErrHomeIncarnationNotFound
 	}
