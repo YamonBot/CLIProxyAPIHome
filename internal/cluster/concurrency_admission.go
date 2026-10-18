@@ -138,7 +138,8 @@ func (r *Repository) LockActiveConcurrencyLifetimeTx(ctx context.Context, tx *go
 	}
 
 	var membership CPANodeMembershipRecord
-	errMembership := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
+	// Lifetime validation does not modify membership; cancellation still needs an exclusive lock.
+	errMembership := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "SHARE"}).
 		Where("certificate_fingerprint = ? AND connected_at = ? AND state = ? AND home_ip = ? AND home_port = ? AND home_started_at = ?", strings.TrimSpace(lifetime.Fingerprint), lifetime.ConnectedAt, MembershipStateActive, strings.TrimSpace(lifetime.Home.IP), lifetime.Home.Port, lifetime.Home.StartedAt).
 		First(&membership).Error
 	if errMembership != nil {
