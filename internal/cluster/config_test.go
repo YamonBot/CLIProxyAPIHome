@@ -297,3 +297,58 @@ func TestConfigValidateRejectsNegativeExternalPort(t *testing.T) {
 		t.Fatalf("unexpected validation error: %v", errValidate)
 	}
 }
+
+func TestPostgresPoolSettingsDoNotSelectDatabaseBackend(t *testing.T) {
+	maxOpen, maxIdle := 12, 2
+	cfg := PGSQLConfig{MaxOpenConns: &maxOpen, MaxIdleConns: &maxIdle}
+	if cfg.Configured() {
+		t.Fatal("pool settings alone selected PostgreSQL")
+	}
+	if _, errDSN := cfg.DSN(); errDSN == nil || !strings.Contains(errDSN.Error(), "pgsql.host is required") {
+		t.Fatalf("pool-only DSN error = %v, want missing connection settings", errDSN)
+	}
+}
+
+func TestLoadConfigOptionalPostgresPoolLimits(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		settings  string
+		maxOpen   int
+		maxIdle   int
+		wantError string
+	}{
+		{name: "defaults", maxOpen: 24, maxIdle: 8},
+		{name: "configured", settings: "  max-open-conns: 12\n  max-idle-conns: 2\n", maxOpen: 12, maxIdle: 2},
+		{name: "smaller open limit", settings: "  max-open-conns: 4\n", maxOpen: 4, maxIdle: 4},
+		{name: "no idle connections", settings: "  max-idle-conns: 0\n", maxOpen: 24, maxIdle: 0},
+		{name: "zero open", settings: "  max-open-conns: 0\n", wantError: "max-open-conns must be greater than 0"},
+		{name: "negative open", settings: "  max-open-conns: -1\n", wantError: "max-open-conns must be greater than 0"},
+		{name: "negative idle", settings: "  max-idle-conns: -1\n", wantError: "max-idle-conns must not be negative"},
+		{name: "idle above open", settings: "  max-open-conns: 12\n  max-idle-conns: 13\n", wantError: "max-idle-conns must not exceed max-open-conns"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "cluster.yaml")
+			content := "pgsql:\n  postgres_uri: postgresql://pool-test@localhost/home\n" + test.settings + "node:\n  port: 8327\n"
+			if errWrite := os.WriteFile(configPath, []byte(content), 0o600); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			cfg, exists, errLoad := LoadConfigOptional(configPath)
+			if !exists {
+				t.Fatal("configuration missing")
+			}
+			if test.wantError != "" {
+				if errLoad == nil || !strings.Contains(errLoad.Error(), test.wantError) {
+					t.Fatalf("configuration error = %v, want %q", errLoad, test.wantError)
+				}
+				return
+			}
+			if errLoad != nil {
+				t.Fatal(errLoad)
+			}
+			maxOpen, maxIdle := cfg.PGSQL.poolLimits()
+			if maxOpen != test.maxOpen || maxIdle != test.maxIdle {
+				t.Fatalf("pool limits = %d/%d, want %d/%d", maxOpen, maxIdle, test.maxOpen, test.maxIdle)
+			}
+		})
+	}
+}

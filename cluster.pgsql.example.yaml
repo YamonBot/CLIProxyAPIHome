@@ -30,6 +30,14 @@ pgsql:
   # Optional; defaults to "200ms". Uses Go duration syntax such as "1s".
   slow-query-threshold: "200ms"
 
+  # Optional per-Home-process connection budget; defaults to 24 open / 8 idle.
+  # Budget all Home replicas and other clients against the database's limits.
+  # max-open-conns must be positive; max-idle-conns may be 0 to disable idle
+  # retention and must not exceed max-open-conns. An omitted idle limit is
+  # capped at the smaller of 8 and max-open-conns.
+  max-open-conns: 24
+  max-idle-conns: 8
+
 node:
   # Optional public address advertised to other Home nodes and CPA clients.
   # external-ip: "203.0.113.10"
