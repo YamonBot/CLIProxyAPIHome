@@ -27,6 +27,16 @@ const (
 )
 
 // Open opens the resource.
+// Postgres pool bounds: the Home process is one pod with a handful of
+// background loops (quota collector, coordinator, auth refresh, API reads);
+// measured steady usage stays well below these ceilings.
+const (
+	defaultPostgresMaxOpenConns    = 24
+	defaultPostgresMaxIdleConns    = 8
+	defaultPostgresConnMaxLifetime = 30 * time.Minute
+	defaultPostgresConnMaxIdleTime = 5 * time.Minute
+)
+
 func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	// Keep validation before state changes so failures leave existing data intact.
 	if ctx == nil {
@@ -47,6 +57,15 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	if errDB != nil {
 		return nil, errDB
 	}
+	// Bound the connection pool: database/sql defaults to unlimited open
+	// connections, so every reconnect storm (node flaps, failovers) stacked
+	// new conns while stale idle ones lingered and exhausted the server's
+	// 150 slots (SQLSTATE 53300, repeated Home outages). Idle recycling
+	// keeps flapped connections from accumulating for hours.
+	sqlDB.SetMaxOpenConns(defaultPostgresMaxOpenConns)
+	sqlDB.SetMaxIdleConns(defaultPostgresMaxIdleConns)
+	sqlDB.SetConnMaxLifetime(defaultPostgresConnMaxLifetime)
+	sqlDB.SetConnMaxIdleTime(defaultPostgresConnMaxIdleTime)
 	if errPing := sqlDB.PingContext(ctx); errPing != nil {
 		if errClose := sqlDB.Close(); errClose != nil {
 			return nil, fmt.Errorf("ping postgres: %w; close sql db: %v", errPing, errClose)
