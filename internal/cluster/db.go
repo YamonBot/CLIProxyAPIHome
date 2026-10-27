@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,15 @@ const (
 	usageDerivedColumnBackfillStateKey              = "internal:migration:usage-derived-columns:v1"
 )
 
+// Pool limits apply per Home process; replicas and other database clients must
+// share the PostgreSQL server's connection budget.
+const (
+	defaultPostgresMaxOpenConns    = 24
+	defaultPostgresMaxIdleConns    = 8
+	defaultPostgresConnMaxLifetime = 30 * time.Minute
+	defaultPostgresConnMaxIdleTime = 5 * time.Minute
+)
+
 // Open opens the resource.
 func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	// Keep validation before state changes so failures leave existing data intact.
@@ -38,7 +48,11 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 		return nil, errDSN
 	}
 
-	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(cfg.SlowQueryThreshold))
+	gormConfig := databaseGORMConfig(cfg.SlowQueryThreshold)
+	// Configure the pool before its first connection and use the startup context
+	// for the ping, so a failed attempt can close the pool before retrying.
+	gormConfig.DisableAutomaticPing = true
+	db, errOpen := gorm.Open(postgres.Open(dsn), gormConfig)
 	if errOpen != nil {
 		return nil, errOpen
 	}
@@ -47,14 +61,28 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	if errDB != nil {
 		return nil, errDB
 	}
-	if errPing := sqlDB.PingContext(ctx); errPing != nil {
-		if errClose := sqlDB.Close(); errClose != nil {
-			return nil, fmt.Errorf("ping postgres: %w; close sql db: %v", errPing, errClose)
-		}
-		return nil, errPing
+	if errInitialize := initializePostgresPool(ctx, sqlDB, cfg); errInitialize != nil {
+		return nil, errInitialize
 	}
 
 	return db, nil
+}
+
+func initializePostgresPool(ctx context.Context, sqlDB *sql.DB, cfg PGSQLConfig) error {
+	// database/sql queues callers at the open limit. Lifetime and idle recycling
+	// do not interrupt connections held by active queries or transactions.
+	maxOpen, maxIdle := cfg.poolLimits()
+	sqlDB.SetMaxOpenConns(maxOpen)
+	sqlDB.SetMaxIdleConns(maxIdle)
+	sqlDB.SetConnMaxLifetime(defaultPostgresConnMaxLifetime)
+	sqlDB.SetConnMaxIdleTime(defaultPostgresConnMaxIdleTime)
+	if errPing := sqlDB.PingContext(ctx); errPing != nil {
+		if errClose := sqlDB.Close(); errClose != nil {
+			return fmt.Errorf("ping postgres: %w; close sql db: %v", errPing, errClose)
+		}
+		return errPing
+	}
+	return nil
 }
 
 // OpenSQLite opens a SQLite database.
