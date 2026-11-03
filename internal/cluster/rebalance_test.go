@@ -470,6 +470,20 @@ func TestRebalanceConvergesWithBoundedPlans(t *testing.T) {
 		t.Run(strconv.Itoa(count), func(t *testing.T) {
 			f := newRebalanceFixture(t, count)
 			for round := range 30 {
+				// Keep native liveness current while large fixtures and race instrumentation run.
+				for index, home := range f.homes {
+					if errBeat := f.repo.HeartbeatHomeIncarnation(t.Context(), home); errBeat != nil {
+						t.Fatal(errBeat)
+					}
+					if errBeat := f.coordinators[index].heartbeatAndElect(t.Context(), home); errBeat != nil {
+						t.Fatal(errBeat)
+					}
+				}
+				for _, lifetime := range f.lifetimes {
+					if errBeat := f.repo.RefreshCPALiveness(t.Context(), lifetime); errBeat != nil {
+						t.Fatal(errBeat)
+					}
+				}
 				if errUpdate := f.repo.db.Model(&ClusterMasterGateRecord{}).Where("id = ?", 1).Update("last_balance_at", time.Time{}).Error; errUpdate != nil {
 					t.Fatal(errUpdate)
 				}
