@@ -133,7 +133,7 @@ func withConcurrencyTransaction(ctx context.Context, db *gorm.DB, fn func(*gorm.
 }
 
 // LockActiveConcurrencyLifetimeTx pins the active membership and Home until the command commits.
-// State transitions must take FOR UPDATE; KEY SHARE lets independent commands and heartbeats proceed.
+// SHARE permits concurrent validators while blocking non-key state-fencing updates.
 func (r *Repository) LockActiveConcurrencyLifetimeTx(ctx context.Context, tx *gorm.DB, lifetime ConnectionLifetime) error {
 	if tx == nil || !lifetime.Controlled || strings.TrimSpace(lifetime.Fingerprint) == "" || lifetime.ConnectedAt.IsZero() {
 		return ErrConcurrencyNodeUnavailable
