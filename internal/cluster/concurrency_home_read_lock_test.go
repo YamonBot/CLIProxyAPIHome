@@ -49,7 +49,7 @@ func TestPostgresConcurrencyLifetimeSharesValidationLocksButBlocksFencing(t *tes
 					t.Errorf("rollback holder: %v", errRollback)
 				}
 			}()
-			if errVerify := holder.Clauses(clause.Locking{Strength: "SHARE"}).Where(where, args...).First(record).Error; errVerify != nil {
+			if errVerify := holder.Clauses(clause.Locking{Strength: "KEY SHARE"}).Where(where, args...).First(record).Error; errVerify != nil {
 				t.Fatal(errVerify)
 			}
 
@@ -68,6 +68,10 @@ func TestPostgresConcurrencyLifetimeSharesValidationLocksButBlocksFencing(t *tes
 			errFence := repo.db.Transaction(func(tx *gorm.DB) error {
 				if errTimeout := tx.Exec("SET LOCAL lock_timeout = '200ms'").Error; errTimeout != nil {
 					return errTimeout
+				}
+				// Native lifecycle transitions lock FOR UPDATE before changing state.
+				if errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(where, args...).First(record).Error; errLock != nil {
+					return errLock
 				}
 				return tx.Model(record).Where(where, args...).Update("state", state).Error
 			})

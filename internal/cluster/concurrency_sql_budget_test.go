@@ -94,9 +94,10 @@ func TestConcurrencySQLBudgets(t *testing.T) {
 				if errAdmit != nil || !result.Accounted {
 					t.Fatalf("%s admission=(%#v,%v)", phase, result, errAdmit)
 				}
-				// GORM traces business SQL, not database/sql Begin/Commit calls.
-				if count := counter.statements.Load(); count != 6 {
-					t.Fatalf("%s SQL statements=%d, want 6", phase, count)
+				// GORM traces business SQL, including the retained auth-state lock,
+				// but not database/sql Begin/Commit calls.
+				if count := counter.statements.Load(); count != 7 {
+					t.Fatalf("%s SQL statements=%d, want 7", phase, count)
 				}
 			}
 			release := ConcurrencyReleaseRequest{CredentialID: request.CredentialID, Model: request.Model, ReleaseSeq: 1, Lifetime: request.Lifetime}

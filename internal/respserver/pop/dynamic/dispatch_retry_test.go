@@ -151,6 +151,7 @@ func TestBuildDispatchErrorJSONPreservesModelCooldownRetryAfter(t *testing.T) {
 
 func TestHandleAuthCooldownIncludesCredentialRequestRetryLimit(t *testing.T) {
 	ctx := context.Background()
+	runtime := newAuthValidateRuntime(t, ctx, "dispatch-client-key", "deleted-dispatch-client-key")
 	db, errOpen := cluster.OpenSQLite(ctx, filepath.Join(t.TempDir(), "retry-home.db"))
 	if errOpen != nil {
 		t.Fatalf("OpenSQLite() error = %v", errOpen)
@@ -200,7 +201,6 @@ func TestHandleAuthCooldownIncludesCredentialRequestRetryLimit(t *testing.T) {
 		t.Fatalf("minimal metadata exposed access_token: %#v", minimal.Metadata)
 	}
 
-	runtime := newAuthValidateRuntime(t, ctx, "dispatch-client-key", "deleted-dispatch-client-key")
 	runtime.CoreManager().SetFullAuthResolver(nil)
 	runtime.CoreManager().SetConfig(&appconfig.Config{RequestRetry: 0})
 	registry.GetGlobalRegistry().RegisterClient("retry-cooling-auth", "codex", []*registry.ModelInfo{{ID: "gpt"}})
