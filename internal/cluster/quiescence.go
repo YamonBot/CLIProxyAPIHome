@@ -392,7 +392,7 @@ func (r *Repository) RefreshCPALiveness(ctx context.Context, lifetime Connection
 		if membership.State != MembershipStateActive || !membership.ConnectedAt.Equal(lifetime.ConnectedAt) || !membershipOwnedByHome(membership, lifetime.Home) {
 			return ErrMembershipNotActive
 		}
-		if errHome := verifyActiveHomeIncarnationWithLock(tx, lifetime.Home, "SHARE"); errHome != nil {
+		if errHome := verifyActiveHomeIncarnationWithLock(tx, lifetime.Home, "KEY SHARE"); errHome != nil {
 			return errHome
 		}
 		// Persist the heartbeat before PONG without competing with lifecycle read locks.
@@ -530,7 +530,7 @@ func lifecycleConfigForQuiescence(tx *gorm.DB) (LifecycleConfigRecord, error) {
 }
 
 func verifyActiveHomeIncarnation(tx *gorm.DB, home HomeIncarnationID) error {
-	return verifyActiveHomeIncarnationWithLock(tx, home, "UPDATE")
+	return verifyActiveHomeIncarnationWithLock(tx, home, "KEY SHARE")
 }
 
 func verifyActiveHomeIncarnationWithLock(tx *gorm.DB, home HomeIncarnationID, strength string) error {

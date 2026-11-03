@@ -37,7 +37,7 @@ func TestPostgresHomeVerificationSharesLockButBlocksFencing(t *testing.T) {
 			t.Errorf("rollback holder: %v", errRollback)
 		}
 	}()
-	if errVerify := holder.Clauses(clause.Locking{Strength: "SHARE"}).First(&HomeProcessIncarnationRecord{}, "home_ip = ? AND home_port = ? AND started_at = ?", home.IP, home.Port, home.StartedAt).Error; errVerify != nil {
+	if errVerify := holder.Clauses(clause.Locking{Strength: "KEY SHARE"}).First(&HomeProcessIncarnationRecord{}, "home_ip = ? AND home_port = ? AND started_at = ?", home.IP, home.Port, home.StartedAt).Error; errVerify != nil {
 		t.Fatal(errVerify)
 	}
 
@@ -56,6 +56,9 @@ func TestPostgresHomeVerificationSharesLockButBlocksFencing(t *testing.T) {
 	errFence := repo.db.Transaction(func(tx *gorm.DB) error {
 		if errTimeout := tx.Exec("SET LOCAL lock_timeout = '200ms'").Error; errTimeout != nil {
 			return errTimeout
+		}
+		if errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&HomeProcessIncarnationRecord{}, "home_ip = ? AND home_port = ? AND started_at = ?", home.IP, home.Port, home.StartedAt).Error; errLock != nil {
+			return errLock
 		}
 		return tx.Model(&HomeProcessIncarnationRecord{}).
 			Where("home_ip = ? AND home_port = ? AND started_at = ?", home.IP, home.Port, home.StartedAt).
