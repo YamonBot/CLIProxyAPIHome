@@ -479,7 +479,13 @@ func TestRebalanceConvergesWithBoundedPlans(t *testing.T) {
 						t.Fatal(errBeat)
 					}
 				}
-				for _, lifetime := range f.lifetimes {
+				var activeMembers []CPANodeMembershipRecord
+				if errRead := f.repo.db.Where("state = ?", MembershipStateActive).Find(&activeMembers).Error; errRead != nil {
+					t.Fatal(errRead)
+				}
+				for _, member := range activeMembers {
+					lifetime := ConnectionLifetime{Fingerprint: member.CertificateFingerprint, ConnectedAt: member.ConnectedAt,
+						Home: HomeIncarnationID{IP: member.HomeIP, Port: member.HomePort, StartedAt: member.HomeStartedAt}, Controlled: true}
 					if errBeat := f.repo.RefreshCPALiveness(t.Context(), lifetime); errBeat != nil {
 						t.Fatal(errBeat)
 					}
