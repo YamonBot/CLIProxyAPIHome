@@ -83,3 +83,44 @@ func TestRunIfEmptyRequiresImport(t *testing.T) {
 		t.Fatalf("invalid mode opened a database: %v", errStat)
 	}
 }
+
+func TestRunImportIfEmptyPreservesLegacyConfigBeforeMigration(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	dbPath := filepath.Join(dir, "legacy.db")
+	db, errOpen := cluster.OpenSQLite(context.Background(), dbPath)
+	if errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatal(errDB)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if errMigrate := cluster.AutoMigrateContext(context.Background(), db); errMigrate != nil {
+		t.Fatal(errMigrate)
+	}
+	legacy := cluster.ConfigRecord{Key: "api-keys", Value: cluster.JSONB(`["legacy-client"]`), Version: 1}
+	if errCreate := db.Create(&legacy).Error; errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	var before cluster.ConfigRecord
+	if errRead := db.First(&before, "key = ?", legacy.Key).Error; errRead != nil {
+		t.Fatal(errRead)
+	}
+	oldArgs, oldCommandLine := os.Args, flag.CommandLine
+	t.Cleanup(func() { os.Args, flag.CommandLine = oldArgs, oldCommandLine })
+	os.Args = []string{"home", "-import", "-if-empty", "-sqlite-path", dbPath, "-config", filepath.Join(dir, "missing.yaml")}
+	flag.CommandLine = flag.NewFlagSet("home", flag.ContinueOnError)
+	if exit := run(); exit != 0 {
+		t.Fatalf("legacy initialized import exit = %d", exit)
+	}
+	var after cluster.ConfigRecord
+	if errRead := db.First(&after, "key = ?", legacy.Key).Error; errRead != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("legacy config changed: %v", errRead)
+	}
+	var keyCount int64
+	if errCount := db.Model(&cluster.APIKeyRecord{}).Count(&keyCount).Error; errCount != nil || keyCount != 0 {
+		t.Fatalf("skipped import migrated legacy keys: count=%d err=%v", keyCount, errCount)
+	}
+}

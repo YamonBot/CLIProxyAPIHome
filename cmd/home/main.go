@@ -206,6 +206,17 @@ func run() int {
 			log.Warnf("failed to close sql db: %v", errCloseSQL)
 		}
 	}()
+	if importOnlyIfEmpty {
+		initialized, errInitialized := configInitializedBeforeMigration(runCtx, clusterDB)
+		if errInitialized != nil {
+			log.Errorf("failed to inspect existing database config: %v", errInitialized)
+			return 1
+		}
+		if initialized {
+			log.Info("database config already initialized; import skipped")
+			return 0
+		}
+	}
 	if databaseSnapshot != nil {
 		result, errImport := cluster.ImportDatabaseSnapshot(runCtx, clusterDB, databaseSnapshot, nil)
 		if errImport != nil {
@@ -715,6 +726,32 @@ func openPostgresDatabaseWithRetry(ctx context.Context, cfg cluster.PGSQLConfig)
 		case <-time.After(runtimeDatabaseOpenRetryInterval):
 		}
 	}
+}
+
+// configInitializedBeforeMigration preserves legacy config rows that startup
+// migrations would otherwise move or remove before the import guard can see them.
+func configInitializedBeforeMigration(ctx context.Context, db *gorm.DB) (bool, error) {
+	var tableExists bool
+	var query string
+	switch db.Dialector.Name() {
+	case "sqlite":
+		query = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config')"
+	case "postgres":
+		query = "SELECT to_regclass('config') IS NOT NULL"
+	default:
+		return false, fmt.Errorf("unsupported database backend for guarded import")
+	}
+	if err := db.WithContext(ctx).Raw(query).Scan(&tableExists).Error; err != nil {
+		return false, err
+	}
+	if !tableExists {
+		return false, nil
+	}
+	var count int64
+	if err := db.WithContext(ctx).Model(&cluster.ConfigRecord{}).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count != 0, nil
 }
 
 // openRuntimeDatabase opens the database used by the DB-backed runtime.
