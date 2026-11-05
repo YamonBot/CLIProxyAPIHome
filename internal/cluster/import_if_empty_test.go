@@ -26,6 +26,83 @@ func TestImportLocalStateOnlyIfEmptyPreservesInitializedDatabasePostgres(t *test
 	testImportOnlyIfEmptyPreserves(t, db)
 }
 
+func TestImportLocalStateOnlyIfEmptyInitializesConfigWithExistingAPIKeys(t *testing.T) {
+	testImportOnlyIfEmptyExistingAPIKeys(t, openImportTestSQLite(t))
+}
+
+func TestImportLocalStateOnlyIfEmptyInitializesConfigWithExistingAPIKeysPostgres(t *testing.T) {
+	db, errDB := newPostgresQuiescenceRepository(t).database()
+	if errDB != nil {
+		t.Fatal(errDB)
+	}
+	testImportOnlyIfEmptyExistingAPIKeys(t, db)
+}
+
+func testImportOnlyIfEmptyExistingAPIKeys(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	existing := APIKeyRecord{APIKey: "existing-client"}
+	if errCreate := db.Create(&existing).Error; errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	var before APIKeyRecord
+	if errFind := db.First(&before, existing.ID).Error; errFind != nil {
+		t.Fatal(errFind)
+	}
+	dir := t.TempDir()
+	seed := filepath.Join(dir, "config.yaml")
+	writeFile(t, seed, "port: 8317\n")
+	repo := NewRepository(db)
+	if _, errImport := ImportLocalState(context.Background(), ImportOptions{
+		ConfigPath: seed, AuthDir: dir, Repository: repo, OnlyIfEmpty: true,
+	}); errImport != nil {
+		t.Fatal(errImport)
+	}
+	snapshot, errSnapshot := repo.LoadConfigSnapshot(context.Background())
+	if errSnapshot != nil || string(snapshot["port"]) != "8317" {
+		t.Fatalf("config not initialized: %v, %v", snapshot, errSnapshot)
+	}
+	var after APIKeyRecord
+	if errFind := db.First(&after, existing.ID).Error; errFind != nil {
+		t.Fatal(errFind)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("config-only seed changed the existing API key")
+	}
+}
+
+func TestImportLocalStateOnlyIfEmptyPreservesLegacyConfigRowWithoutSeed(t *testing.T) {
+	testImportOnlyIfEmptyLegacyConfigRow(t, openImportTestSQLite(t))
+}
+
+func TestImportLocalStateOnlyIfEmptyPreservesLegacyConfigRowWithoutSeedPostgres(t *testing.T) {
+	db, errDB := newPostgresQuiescenceRepository(t).database()
+	if errDB != nil {
+		t.Fatal(errDB)
+	}
+	testImportOnlyIfEmptyLegacyConfigRow(t, db)
+}
+
+func testImportOnlyIfEmptyLegacyConfigRow(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if errCreate := db.Create(&ConfigRecord{
+		Key: configAPIKeysRootKey, Value: JSONB(`["legacy-client"]`),
+	}).Error; errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	before := importDatabaseRows(t, db)
+	dir := t.TempDir()
+	stats, errImport := ImportLocalState(context.Background(), ImportOptions{
+		ConfigPath: filepath.Join(dir, "missing.yaml"), AuthDir: dir,
+		Repository: NewRepository(db), OnlyIfEmpty: true,
+	})
+	if errImport != nil || stats != (ImportStats{}) {
+		t.Fatalf("existing config row must skip missing seed: %+v, %v", stats, errImport)
+	}
+	if !reflect.DeepEqual(before, importDatabaseRows(t, db)) {
+		t.Fatal("legacy config or other database rows changed")
+	}
+}
+
 func testImportOnlyIfEmptyPreserves(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	repo := NewRepository(db)

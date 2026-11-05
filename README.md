@@ -88,7 +88,7 @@ Set `slow-query-threshold` under the selected `pgsql` or `sqlite` backend to con
 
 By default, import reads `./config.yaml` and then resolves credentials from the `auth-dir` value inside that config. Use `-config <path>` to select another config file, `-auth-dir <path>` to override credential discovery, and `-sqlite-path <path>` when importing into a non-default SQLite database. Import is idempotent, so rerunning it with the same files does not duplicate records.
 
-For initial provisioning, use `-import -if-empty` to leave an initialized database unchanged. This mode skips source-file reads when configuration already exists and rechecks under the shared configuration mutation lock before importing into an empty database. It does not replace an explicit `-import` when updating existing configuration. `-if-empty` requires `-import`.
+For initial provisioning, use `-import -if-empty` to leave an initialized database unchanged. This mode checks for rows in the `config` table, skips source-file reads when any exist, and rechecks under the shared configuration mutation lock before importing. API keys alone do not mark configuration initialized. It does not replace an explicit `-import` when updating existing configuration. `-if-empty` requires `-import`.
 
 To export config and credentials back to local files, run:
 

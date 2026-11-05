@@ -74,12 +74,16 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 	if opts.Repository == nil {
 		return stats, fmt.Errorf("import repository is required")
 	}
+	db, errDB := opts.Repository.database()
+	if errDB != nil {
+		return stats, errDB
+	}
 	if opts.OnlyIfEmpty {
-		snapshot, errSnapshot := opts.Repository.LoadConfigSnapshot(ctx)
-		if errSnapshot != nil {
-			return stats, errSnapshot
+		var configCount int64
+		if errCount := db.WithContext(ctx).Model(&ConfigRecord{}).Count(&configCount).Error; errCount != nil {
+			return stats, errCount
 		}
-		if len(snapshot) != 0 {
+		if configCount != 0 {
 			log.Info("database config already initialized; import skipped")
 			return stats, nil
 		}
@@ -149,10 +153,6 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 	}
 	if errValidate := validateImportCredentialCollisions(ctx, opts.Repository, pendingAuths, authOrder); errValidate != nil {
 		return stats, errValidate
-	}
-	db, errDB := opts.Repository.database()
-	if errDB != nil {
-		return stats, errDB
 	}
 	mutationStats := ImportStats{}
 	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
