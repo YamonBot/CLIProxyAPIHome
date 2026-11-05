@@ -118,6 +118,7 @@ func run() int {
 	var addr string
 	var sqlitePath string
 	var importState bool
+	var importOnlyIfEmpty bool
 	var exportState bool
 	var databaseImportPath string
 	var databaseExportPath string
@@ -127,12 +128,17 @@ func run() int {
 	flag.StringVar(&addr, "addr", "", "Override RESP listen address (host:port)")
 	flag.StringVar(&sqlitePath, "sqlite-path", "", "SQLite database path")
 	flag.BoolVar(&importState, "import", false, "Import config and auth files into database, then exit")
+	flag.BoolVar(&importOnlyIfEmpty, "if-empty", false, "With -import, preserve an already initialized database")
 	flag.BoolVar(&exportState, "export", false, "Export config and auth files from database, then exit")
 	flag.StringVar(&databaseImportPath, "db-import", "", "Import a portable Home database snapshot, then exit")
 	flag.StringVar(&databaseExportPath, "db-export", "", "Export a portable Home database snapshot, then exit")
 	flag.StringVar(&exportDir, "export-dir", "", "Override output directory used by export")
 	flag.StringVar(&authDir, "auth-dir", "", "Override auth directory used by import")
 	flag.Parse()
+	if importOnlyIfEmpty && !importState {
+		log.Errorf("-if-empty requires -import")
+		return 1
+	}
 	databaseImportPath = strings.TrimSpace(databaseImportPath)
 	databaseExportPath = strings.TrimSpace(databaseExportPath)
 	if oneTimeModeCount(importState, exportState, databaseImportPath, databaseExportPath) > 1 {
@@ -200,6 +206,17 @@ func run() int {
 			log.Warnf("failed to close sql db: %v", errCloseSQL)
 		}
 	}()
+	if importOnlyIfEmpty {
+		initialized, errInitialized := configInitializedBeforeMigration(runCtx, clusterDB)
+		if errInitialized != nil {
+			log.Errorf("failed to inspect existing database config: %v", errInitialized)
+			return 1
+		}
+		if initialized {
+			log.Info("database config already initialized; import skipped")
+			return 0
+		}
+	}
 	if databaseSnapshot != nil {
 		result, errImport := cluster.ImportDatabaseSnapshot(runCtx, clusterDB, databaseSnapshot, nil)
 		if errImport != nil {
@@ -235,15 +252,18 @@ func run() int {
 	repo := cluster.NewRepository(clusterDB)
 	clusterRepo = repo
 	nodeCfg := resolveDatabaseNodeConfig(clusterCfg, clusterExists)
-	if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
-		log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
-		return 1
+	if !importOnlyIfEmpty {
+		if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
+			log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
+			return 1
+		}
 	}
 	if importState {
 		stats, errImport := cluster.ImportLocalState(runCtx, cluster.ImportOptions{
 			ConfigPath:           configPath,
 			AuthDir:              authDir,
 			Repository:           repo,
+			OnlyIfEmpty:          importOnlyIfEmpty,
 			NodeHeartbeatTimeout: nodeCfg.HeartbeatTimeout,
 		})
 		if errImport != nil {
@@ -706,6 +726,32 @@ func openPostgresDatabaseWithRetry(ctx context.Context, cfg cluster.PGSQLConfig)
 		case <-time.After(runtimeDatabaseOpenRetryInterval):
 		}
 	}
+}
+
+// configInitializedBeforeMigration preserves legacy config rows that startup
+// migrations would otherwise move or remove before the import guard can see them.
+func configInitializedBeforeMigration(ctx context.Context, db *gorm.DB) (bool, error) {
+	var tableExists bool
+	var query string
+	switch db.Dialector.Name() {
+	case "sqlite":
+		query = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config')"
+	case "postgres":
+		query = "SELECT to_regclass('config') IS NOT NULL"
+	default:
+		return false, fmt.Errorf("unsupported database backend for guarded import")
+	}
+	if err := db.WithContext(ctx).Raw(query).Scan(&tableExists).Error; err != nil {
+		return false, err
+	}
+	if !tableExists {
+		return false, nil
+	}
+	var count int64
+	if err := db.WithContext(ctx).Model(&cluster.ConfigRecord{}).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count != 0, nil
 }
 
 // openRuntimeDatabase opens the database used by the DB-backed runtime.
