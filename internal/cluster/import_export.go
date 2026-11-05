@@ -24,6 +24,7 @@ type ImportOptions struct {
 	ConfigPath           string
 	AuthDir              string
 	Repository           *Repository
+	OnlyIfEmpty          bool
 	NodeHeartbeatTimeout time.Duration
 	Now                  time.Time
 }
@@ -72,6 +73,16 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 	}
 	if opts.Repository == nil {
 		return stats, fmt.Errorf("import repository is required")
+	}
+	if opts.OnlyIfEmpty {
+		snapshot, errSnapshot := opts.Repository.LoadConfigSnapshot(ctx)
+		if errSnapshot != nil {
+			return stats, errSnapshot
+		}
+		if len(snapshot) != 0 {
+			log.Info("database config already initialized; import skipped")
+			return stats, nil
+		}
 	}
 	now := opts.Now
 	if now.IsZero() {
@@ -149,6 +160,17 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 		// activation, credential, or event locks even when no API keys are imported.
 		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
 			return errLock
+		}
+		if opts.OnlyIfEmpty {
+			// Recheck under the shared config mutation lock after source preparation.
+			var configCount int64
+			if errCount := tx.Model(&ConfigRecord{}).Count(&configCount).Error; errCount != nil {
+				return errCount
+			}
+			if configCount != 0 {
+				log.Info("database config already initialized; import skipped")
+				return nil
+			}
 		}
 		gate, errGate := lockConcurrencyActivationGate(tx)
 		if errGate != nil {

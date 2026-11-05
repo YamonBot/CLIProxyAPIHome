@@ -118,6 +118,7 @@ func run() int {
 	var addr string
 	var sqlitePath string
 	var importState bool
+	var importOnlyIfEmpty bool
 	var exportState bool
 	var databaseImportPath string
 	var databaseExportPath string
@@ -127,12 +128,17 @@ func run() int {
 	flag.StringVar(&addr, "addr", "", "Override RESP listen address (host:port)")
 	flag.StringVar(&sqlitePath, "sqlite-path", "", "SQLite database path")
 	flag.BoolVar(&importState, "import", false, "Import config and auth files into database, then exit")
+	flag.BoolVar(&importOnlyIfEmpty, "if-empty", false, "With -import, preserve an already initialized database")
 	flag.BoolVar(&exportState, "export", false, "Export config and auth files from database, then exit")
 	flag.StringVar(&databaseImportPath, "db-import", "", "Import a portable Home database snapshot, then exit")
 	flag.StringVar(&databaseExportPath, "db-export", "", "Export a portable Home database snapshot, then exit")
 	flag.StringVar(&exportDir, "export-dir", "", "Override output directory used by export")
 	flag.StringVar(&authDir, "auth-dir", "", "Override auth directory used by import")
 	flag.Parse()
+	if importOnlyIfEmpty && !importState {
+		log.Errorf("-if-empty requires -import")
+		return 1
+	}
 	databaseImportPath = strings.TrimSpace(databaseImportPath)
 	databaseExportPath = strings.TrimSpace(databaseExportPath)
 	if oneTimeModeCount(importState, exportState, databaseImportPath, databaseExportPath) > 1 {
@@ -235,15 +241,18 @@ func run() int {
 	repo := cluster.NewRepository(clusterDB)
 	clusterRepo = repo
 	nodeCfg := resolveDatabaseNodeConfig(clusterCfg, clusterExists)
-	if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
-		log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
-		return 1
+	if !importOnlyIfEmpty {
+		if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
+			log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
+			return 1
+		}
 	}
 	if importState {
 		stats, errImport := cluster.ImportLocalState(runCtx, cluster.ImportOptions{
 			ConfigPath:           configPath,
 			AuthDir:              authDir,
 			Repository:           repo,
+			OnlyIfEmpty:          importOnlyIfEmpty,
 			NodeHeartbeatTimeout: nodeCfg.HeartbeatTimeout,
 		})
 		if errImport != nil {
