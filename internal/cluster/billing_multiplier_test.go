@@ -4,7 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 )
+
+func TestBillingMultiplierLegacyWriterDefaultPostgres(t *testing.T) {
+	repo := newPostgresQuiescenceRepository(t)
+	if errInsert := repo.db.Exec(`INSERT INTO billing_charge (id,usage_id,payload_hash,amount,price_snapshot,created_at)
+		VALUES ('legacy-writer',1,'legacy-writer',1.25,'{}'::jsonb,now())`).Error; errInsert != nil {
+		t.Fatalf("legacy writer omitted the new multiplier: %v", errInsert)
+	}
+	var legacy BillingChargeRecord
+	if errRead := repo.db.First(&legacy, "id = ?", "legacy-writer").Error; errRead != nil || legacy.BillingMultiplier != 1 || legacy.Amount != 1.25 {
+		t.Fatalf("legacy charge = %+v, error = %v", legacy, errRead)
+	}
+	// A free request explicitly records zero; the ORM must not replace it with one.
+	free := BillingChargeRecord{ID: "free-writer", UsageID: 2, PayloadHash: "free-writer", BillingMultiplier: 0, PriceSnapshot: JSONB(`{}`), CreatedAt: time.Now().UTC()}
+	if errInsert := repo.db.Create(&free).Error; errInsert != nil {
+		t.Fatal(errInsert)
+	}
+	var stored BillingChargeRecord
+	if errRead := repo.db.First(&stored, "id = ?", free.ID).Error; errRead != nil || stored.BillingMultiplier != 0 {
+		t.Fatalf("explicit zero charge = %+v, error = %v", stored, errRead)
+	}
+}
 
 func TestBillingChargeAppliesEffortAndUserMultipliers(t *testing.T) {
 	t.Parallel()

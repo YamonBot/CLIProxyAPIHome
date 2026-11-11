@@ -2205,6 +2205,13 @@ func migrateBillingIndexes(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
+	// Older Home writers omit this column. Set its database default after
+	// AutoMigrate without an ORM default that would replace explicit zeroes.
+	if usageObservabilityIsPostgres(db) {
+		if errDefault := db.Exec(`ALTER TABLE "billing_charge" ALTER COLUMN "billing_multiplier" SET DEFAULT 1`).Error; errDefault != nil {
+			return errDefault
+		}
+	}
 	if errDrop := db.Exec(`DROP INDEX IF EXISTS idx_billing_model_price_active_unique`).Error; errDrop != nil {
 		return errDrop
 	}
