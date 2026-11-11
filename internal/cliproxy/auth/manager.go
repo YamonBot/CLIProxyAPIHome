@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
@@ -106,11 +107,12 @@ type Manager struct {
 	store    Store
 	selector Selector
 
-	mu          sync.RWMutex
-	updateLocks authUpdateLocks
-	auths       map[string]*Auth
-	indexAuth   map[string]*Auth
-	scheduler   *authScheduler
+	mu              sync.RWMutex
+	updateLocks     authUpdateLocks
+	auths           map[string]*Auth
+	indexAuth       map[string]*Auth
+	scheduler       *authScheduler
+	modelAliasHints modelAliasHintIndex
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -362,6 +364,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	delete(m.auths, id)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(id, nil)
 
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
@@ -690,6 +693,7 @@ func (m *Manager) removeAuthLocked(authID string) {
 	delete(m.auths, authID)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(authID, nil)
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(authID)
 	}
@@ -1853,7 +1857,17 @@ func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Erro
 	if auth == nil || errRefresh == nil {
 		return nil
 	}
-	if isTerminalRefreshAuthError(errRefresh) {
+	unknownOutcome := false
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		codexauth.RecordRefreshOutcomeUnknown(auth.Metadata, errRefresh)
+		var authErr *Error
+		unknownOutcome = codexauth.IsRefreshOutcomeUnknown(errRefresh) ||
+			(errors.As(errRefresh, &authErr) && authErr.Code == ErrorCodeRefreshOutcomeUnknown)
+	}
+	if !unknownOutcome && isTerminalRefreshAuthError(errRefresh) {
 		refreshFailure := newUnauthorizedRefreshErrorFrom(errRefresh)
 		disableAuthAfterUnauthorized(auth, nil, refreshFailure, now)
 		return refreshFailure
@@ -1869,6 +1883,12 @@ func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Erro
 		}
 	}
 	refreshFailure := newTransientRefreshErrorFrom(errRefresh)
+	if unknownOutcome {
+		refreshFailure.Code = ErrorCodeRefreshOutcomeUnknown
+		refreshFailure.Message = "credential refresh outcome unknown; replace the refresh credentials before retrying"
+		refreshFailure.Retryable = false
+		refreshFailure.Upstream = nil
+	}
 	if refreshFailure.Diagnostic != "" && !strings.Contains(refreshFailure.Diagnostic, "retry_at=") {
 		refreshFailure.Diagnostic = logging.SafeDiagnosticForLog(refreshFailure.Diagnostic + " retry_at=" + retryAt.UTC().Format(time.RFC3339Nano))
 	}
@@ -2203,6 +2223,9 @@ func copyUpstreamResponse(target *Error, errRefresh error) bool {
 // proxies and provider edges can return them for transient failures.
 func isTerminalRefreshAuthError(errRefresh error) bool {
 	if errRefresh == nil || errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+		return false
+	}
+	if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 		return false
 	}
 	var authErr *Error
@@ -2703,18 +2726,24 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
 	now = time.Now().UTC()
 	if errRefresh != nil {
-		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
+		if (errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil) && !codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 			return nil, errRefresh
 		}
 		snapshot := target.Clone()
 		refreshFailure := ApplyRefreshFailureState(snapshot, errRefresh, now)
 		logCredentialRefreshFailure(ctx, snapshot, refreshFailure)
-		updatedPersisted, errUpdate := m.Update(ctx, snapshot)
+		persistCtx := ctx
+		if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
+			var cancelPersist context.CancelFunc
+			persistCtx, cancelPersist = withRefreshProviderTimeout(context.WithoutCancel(ctx))
+			defer cancelPersist()
+		}
+		updatedPersisted, errUpdate := m.Update(persistCtx, snapshot)
 		if errUpdate != nil {
 			return nil, errUpdate
 		}
@@ -2820,12 +2849,12 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
 	now := time.Now().UTC()
 	if errRefresh != nil {
-		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
+		if (errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil) && !codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 			return target.Clone(), errRefresh
 		}
 		snapshot := target.Clone()
@@ -2997,7 +3026,7 @@ func isRefreshAcquisitionError(authErr *Error) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
-	case refreshTransientErrorCode, refreshUnsupportedCode:
+	case refreshTransientErrorCode, refreshUnsupportedCode, ErrorCodeRefreshOutcomeUnknown:
 		return true
 	default:
 		return false

@@ -114,10 +114,19 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 
 // registerResolvedModelsForAuth returns a register resolved models for auth.
 func (r *Runtime) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models, candidates []*ModelInfo) {
-	if a == nil || a.ID == "" {
+	if r == nil || a == nil || a.ID == "" {
 		return
 	}
 	registry.GetGlobalRegistry().RegisterClientWithCandidates(a.ID, providerKey, models, candidates)
+	if r.coreManager != nil {
+		modelIDs := make([]string, 0, len(models))
+		for _, model := range models {
+			if model != nil {
+				modelIDs = append(modelIDs, model.ID)
+			}
+		}
+		r.coreManager.SetModelAliasHints(a, modelIDs)
+	}
 }
 
 func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *DispatchModelInfo {
@@ -169,6 +178,10 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if r == nil || a == nil || a.ID == "" {
 		return
+	}
+	r.cancelStaleAntigravityProbes(a.ID)
+	if r.coreManager != nil {
+		r.coreManager.SetModelAliasHints(a, nil)
 	}
 	if a.Disabled || a.Status == coreauth.StatusDisabled {
 		registry.GetGlobalRegistry().UnregisterClient(a.ID)
@@ -253,7 +266,14 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	case "antigravity":
-		models = registry.GetAntigravityModels()
+		expectedKey := r.antigravityCapabilityKey(a)
+		hints := r.cachedAntigravityHints(a)
+		if hints.ModelIDs != nil {
+			r.applyAntigravityModelHints(context.Background(), a, provider, hints, expectedKey)
+			r.asyncProbeAntigravityCapabilities(context.Background(), a, provider)
+			return
+		}
+		models = applyAntigravityFetchedModelCapabilities(registry.GetAntigravityModels(), hints)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if len(configModels) > 0 {
@@ -457,6 +477,9 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	models = applyOAuthModelAlias(cfg, provider, authKind, models)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix), candidates)
+	if provider == "antigravity" {
+		r.asyncProbeAntigravityCapabilities(context.Background(), a, key)
+	}
 }
 
 // oauthExcludedModels handles an oauth excluded models.

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
@@ -60,10 +61,17 @@ type Runtime struct {
 	clusterRefresh          func(context.Context, string, string) ([]byte, error)
 	originalStore           coreauth.Store
 
-	clusterUsageQueueMu sync.Mutex
-	clusterUsageQueue   *usagePayloadQueue
-
 	cancel context.CancelFunc
+
+	antigravityProbeMu        sync.Mutex
+	antigravityProbeWg        sync.WaitGroup
+	antigravityAccountProbes  map[string]map[*antigravityAccountProbe]struct{}
+	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
+	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+	antigravityPersistPending map[string]*antigravityHintPersistRequest
+	antigravityRefreshWake    chan struct{}
+	antigravityContext        context.Context
+	antigravityCancel         context.CancelFunc
 
 	fileWatcher interface{ Stop() error }
 }
@@ -176,6 +184,10 @@ type clusterAuthStateObserver interface {
 
 type clusterUsageStore interface {
 	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
+}
+
+type clusterUsageOutcomeStore interface {
+	StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
 }
 
 type appLogStore interface {
@@ -344,7 +356,12 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
-	r.startClusterUsageWriter(runCtx)
+	r.cfgMu.Lock()
+	if r.antigravityCancel != nil {
+		r.antigravityCancel()
+	}
+	r.antigravityContext, r.antigravityCancel = runCtx, cancel
+	r.cfgMu.Unlock()
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -353,6 +370,8 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	}
 
 	registry.StartModelCatalogUpdaters(runCtx, r.Config().Models)
+	cpasdkauth.StartAntigravityVersionUpdater(runCtx)
+	go r.runAntigravityModelRefresh(runCtx)
 	r.registerModelRefreshCallback()
 	managementasset.SetCurrentConfig(r.cfg)
 	managementasset.StartAutoUpdater(context.Background(), configPath)
@@ -389,11 +408,20 @@ func (r *Runtime) Stop() {
 	if r == nil {
 		return
 	}
+	r.cfgMu.Lock()
+	antigravityCancel := r.antigravityCancel
+	r.antigravityCancel = nil
+	stoppedCtx, stopAntigravity := context.WithCancel(context.Background())
+	stopAntigravity()
+	r.antigravityContext = stoppedCtx
+	r.cfgMu.Unlock()
+	if antigravityCancel != nil {
+		antigravityCancel()
+	}
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
 	}
-	r.stopClusterUsageWriter()
 	if r.fileWatcher != nil {
 		_ = r.fileWatcher.Stop()
 		r.fileWatcher = nil
@@ -402,6 +430,8 @@ func (r *Runtime) Stop() {
 		r.pluginHost.ShutdownAll()
 	}
 	r.StopAutoRefresh()
+	r.cancelStaleAntigravityProbes("")
+	r.WaitAntigravityProbes()
 	if r.coreManager != nil {
 		r.coreManager.Shutdown()
 	}
@@ -540,17 +570,33 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 
 // PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
 func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
+	persisted, _, errPersist := r.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
+	return persisted, errPersist
+}
+
+// PersistClusterUsagePayloadOutcome stores a cluster usage payload with its trusted receive time
+// and reports whether the payload was newly inserted (false when deduplicated).
+func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, bool, error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
-		return false, nil
+		return false, false, nil
 	}
-	queue := r.getClusterUsageQueue()
-	if queue == nil {
-		return true, nil
+	if outcomeStore, ok := r.clusterAdapter.(clusterUsageOutcomeStore); ok && outcomeStore != nil {
+		inserted, errStore := outcomeStore.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
+		if errStore != nil {
+			return false, false, errStore
+		}
+		return true, inserted, nil
 	}
-	if ok := queue.Push(payload, receivedAt); !ok {
-		log.Warnf("cluster usage queue is stopped; accepting usage without persistence")
+	store, ok := r.clusterAdapter.(clusterUsageStore)
+	if !ok || store == nil {
+		return false, false, fmt.Errorf("cluster usage store is unavailable")
 	}
-	return true, nil
+	// Acknowledge usage only after its database transaction commits. A failed
+	// write must reach the sender, not disappear from an in-memory queue.
+	if errStore := store.StoreUsagePayload(ctx, payload, receivedAt); errStore != nil {
+		return false, false, errStore
+	}
+	return true, true, nil
 }
 
 // PersistAppLogPayload stores a CPA app log payload in the runtime database.
@@ -872,7 +918,7 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey, reqModel)
 	if errAllowed != nil {
-		return nil, errAllowed
+		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
 	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
 	if pinnedAuthID != "" {
@@ -907,7 +953,8 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
 	}
-	return r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	result, errDispatch := r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	return result, r.withModelAliasHint(ctx, errDispatch, reqModel, apiKey)
 }
 
 func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
@@ -1149,6 +1196,44 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 		allowedModelIDs = modelIDs
 	}
 	return allowedAuthIDs, allowedModelIDs, nil
+}
+
+// withModelAliasHint preserves the original lookup error and adds only aliases
+// visible to this API key. Policy failures omit the optional hint.
+func (r *Runtime) withModelAliasHint(ctx context.Context, err error, reqModel, apiKey string) error {
+	if err == nil || r == nil || r.coreManager == nil {
+		return err
+	}
+	authErr, structured := err.(*coreauth.Error)
+	code := ""
+	if structured {
+		if authErr == nil || authErr.Upstream != nil {
+			return err
+		}
+		code = authErr.Code
+	} else {
+		code, _ = homeerrors.SplitRedisErrorMessage(err.Error())
+	}
+	if code != homeerrors.TypeAuthNotFound && code != homeerrors.TypeModelNotFound {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	policy, errPolicy := r.ModelAccessForAPIKey(ctx, apiKey)
+	if errPolicy != nil {
+		return err
+	}
+	hint := coreauth.ModelAliasHint(reqModel, r.coreManager.AliasesForUpstreamModel(reqModel, policy))
+	if hint == "" {
+		return err
+	}
+	if !structured {
+		return fmt.Errorf("%w; %s", err, hint)
+	}
+	annotated := *authErr
+	annotated.Message = strings.TrimSpace(annotated.Message) + "; " + hint
+	return &annotated
 }
 
 // supportsRequestedModel handles a supports requested model.

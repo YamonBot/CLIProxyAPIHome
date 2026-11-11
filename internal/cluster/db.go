@@ -2,15 +2,18 @@ package cluster
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/stdlib"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -27,11 +30,8 @@ const (
 	usageDerivedColumnBackfillStateKey              = "internal:migration:usage-derived-columns:v1"
 )
 
-// Pool limits apply per Home process; replicas and other database clients must
-// share the PostgreSQL server's connection budget.
+// Preserve connection recycling across Home rolling upgrades.
 const (
-	defaultPostgresMaxOpenConns    = 24
-	defaultPostgresMaxIdleConns    = 8
 	defaultPostgresConnMaxLifetime = 30 * time.Minute
 	defaultPostgresConnMaxIdleTime = 5 * time.Minute
 )
@@ -48,41 +48,50 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 		return nil, errDSN
 	}
 
-	gormConfig := databaseGORMConfig(cfg.SlowQueryThreshold)
-	// Configure the pool before its first connection and use the startup context
-	// for the ping, so a failed attempt can close the pool before retrying.
-	gormConfig.DisableAutomaticPing = true
-	db, errOpen := gorm.Open(postgres.Open(dsn), gormConfig)
+	pgConfig, errParseConfig := pgx.ParseConfig(dsn)
+	if errParseConfig != nil {
+		return nil, errParseConfig
+	}
+	pgConfig.Tracer = postgresTransactionTracer{}
+	// Preserve gorm.io/driver/postgres's timezone and timestamp scan settings
+	// when supplying a pgx pool with a tracer instead of its default pool.
+	var options []stdlib.OptionOpenDB
+	if timezone := regexp.MustCompile(`(time_zone|TimeZone|timezone)=(.*?)($|&| )`).FindStringSubmatch(dsn); len(timezone) > 2 {
+		pgConfig.RuntimeParams["timezone"] = timezone[2]
+		options = append(options, stdlib.OptionAfterConnect(func(_ context.Context, conn *pgx.Conn) error {
+			location, errLoadLocation := time.LoadLocation(timezone[2])
+			if errLoadLocation != nil {
+				return errLoadLocation
+			}
+			conn.TypeMap().RegisterType(&pgtype.Type{
+				Name: "timestamp", OID: pgtype.TimestampOID,
+				Codec: &pgtype.TimestampCodec{ScanLocation: location},
+			})
+			return nil
+		}))
+	}
+	sqlDB := stdlib.OpenDB(*pgConfig, options...)
+	sqlDB.SetConnMaxLifetime(defaultPostgresConnMaxLifetime)
+	sqlDB.SetConnMaxIdleTime(defaultPostgresConnMaxIdleTime)
+	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	if cfg.MaxIdleConns != nil {
+		sqlDB.SetMaxIdleConns(*cfg.MaxIdleConns)
+	}
+	db, errOpen := gorm.Open(postgres.New(postgres.Config{DSN: dsn, Conn: sqlDB}), databaseGORMConfig(cfg.SlowQueryThreshold))
 	if errOpen != nil {
+		if errClose := sqlDB.Close(); errClose != nil {
+			return nil, fmt.Errorf("open postgres: %w; close sql db: %v", errOpen, errClose)
+		}
 		return nil, errOpen
 	}
-
-	sqlDB, errDB := db.DB()
-	if errDB != nil {
-		return nil, errDB
-	}
-	if errInitialize := initializePostgresPool(ctx, sqlDB, cfg); errInitialize != nil {
-		return nil, errInitialize
+	if errPing := sqlDB.PingContext(ctx); errPing != nil {
+		if errClose := sqlDB.Close(); errClose != nil {
+			return nil, fmt.Errorf("ping postgres: %w; close sql db: %v", errPing, errClose)
+		}
+		return nil, errPing
 	}
 
 	return db, nil
-}
-
-func initializePostgresPool(ctx context.Context, sqlDB *sql.DB, cfg PGSQLConfig) error {
-	// database/sql queues callers at the open limit. Lifetime and idle recycling
-	// do not interrupt connections held by active queries or transactions.
-	maxOpen, maxIdle := cfg.poolLimits()
-	sqlDB.SetMaxOpenConns(maxOpen)
-	sqlDB.SetMaxIdleConns(maxIdle)
-	sqlDB.SetConnMaxLifetime(defaultPostgresConnMaxLifetime)
-	sqlDB.SetConnMaxIdleTime(defaultPostgresConnMaxIdleTime)
-	if errPing := sqlDB.PingContext(ctx); errPing != nil {
-		if errClose := sqlDB.Close(); errClose != nil {
-			return fmt.Errorf("ping postgres: %w; close sql db: %v", errPing, errClose)
-		}
-		return errPing
-	}
-	return nil
 }
 
 // OpenSQLite opens a SQLite database.
@@ -238,6 +247,11 @@ func autoMigrate(db *gorm.DB) error {
 func autoMigrateSchema(db *gorm.DB) error {
 	startedAt := time.Now()
 	isPostgres := db.Dialector.Name() == "postgres"
+	if db.Migrator().HasTable(&BillingChargeRecord{}) && !db.Migrator().HasColumn(&BillingChargeRecord{}, "billing_multiplier") {
+		if errAdd := db.Exec(`ALTER TABLE "billing_charge" ADD COLUMN "billing_multiplier" numeric NOT NULL DEFAULT 1`).Error; errAdd != nil {
+			return fmt.Errorf("add billing_charge.billing_multiplier column: %w", errAdd)
+		}
+	}
 	if errMigrate := db.AutoMigrate(databaseMigrationModels()...); errMigrate != nil {
 		log.WithFields(log.Fields{
 			"database_backend":            db.Dialector.Name(),
@@ -267,6 +281,8 @@ func runCustomMigrations(db *gorm.DB) error {
 	}{
 		{name: "migrate_cpa_node_primary_key", run: migrateCPANodePrimaryKey},
 		{name: "migrate_billing_indexes", run: migrateBillingIndexes},
+		{name: "migrate_billing_usage_cover_index", run: migrateBillingUsageCoverIndex},
+		{name: "migrate_billing_overview_indexes", run: migrateBillingOverviewIndexes},
 		{name: "migrate_billing_import_indexes", run: migrateBillingImportIndexes},
 		{name: "migrate_certificate_fingerprints", run: migrateCertificateFingerprints},
 		{name: "migrate_api_key_channels", run: migrateAPIKeyChannels},
@@ -275,6 +291,7 @@ func runCustomMigrations(db *gorm.DB) error {
 		{name: "migrate_user_unique_username", run: migrateUserUniqueUsername},
 		{name: "migrate_user_unique_email", run: migrateUserUniqueEmail},
 		{name: "migrate_auth_next_retry_after", run: migrateAuthNextRetryAfter},
+		{name: "migrate_codex_refresh_outcomes", run: migrateCodexRefreshOutcomes},
 		{name: "migrate_usage_observability_indexes", run: migrateUsageObservabilityIndexes},
 		{name: "migrate_usage_provider_api_key_sources", run: migrateUsageProviderAPIKeySources},
 		{name: "migrate_usage_service_tiers", run: migrateUsageServiceTiers},
