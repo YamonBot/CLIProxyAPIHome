@@ -153,7 +153,7 @@ func TestSubscriptionCancellationDoesNotFenceOtherConnections(t *testing.T) {
 	server := New("", nil)
 	server.fingerprints = registry
 	server.SetClusterHandler(handler)
-	cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connection))
+	cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connection), newSubscriptionLiveness(0))
 	t.Cleanup(cancel)
 	waitSubscriptionTestSignal(t, started, "heartbeat database read")
 	cancel()

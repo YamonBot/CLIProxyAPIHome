@@ -39,7 +39,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Verify transport, quota, cluster and management behavior
-        run: go test -v ./internal/proxyutil ./internal/quota ./internal/cluster/... ./internal/respserver/... ./internal/cliproxy/auth ./internal/home ./cmd/home
+        run: go test ./internal/proxyutil ./internal/quota ./internal/cluster/... ./internal/respserver/... ./internal/cliproxy/auth ./internal/home ./cmd/home
       - name: Build
         run: |
           CGO_ENABLED=1 go build -o test-output ./cmd/home
