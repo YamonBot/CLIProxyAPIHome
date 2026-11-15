@@ -39,7 +39,8 @@ func TestSessionAffinityRollingUpgradePreservesProviderBinding(t *testing.T) {
 				opts.Headers.Set("X-Session-ID", "new-child")
 				opts.Headers.Set("X-Parent-Session-ID", "existing-session")
 			}
-			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Store: store, Fallback: &FillFirstSelector{}, SubagentAffinity: true})
+			inherit := true
+			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Store: store, Fallback: &FillFirstSelector{}, SubagentAffinity: &inherit})
 			picked, err := selector.Pick(t.Context(), "codex", "gpt", opts, auths)
 			want, wantKey := "a", canonicalKey
 			if scenario == "live" {
