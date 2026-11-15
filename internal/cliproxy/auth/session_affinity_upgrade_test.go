@@ -14,8 +14,11 @@ func TestSessionAffinityRollingUpgradePreservesProviderBinding(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			store := NewSessionCache(time.Hour)
 			t.Cleanup(store.Stop)
-			previousKey := sessionBindingKey("codex", "existing-session", "gpt")
-			canonicalKey := sessionBindingKey("mixed", "existing-session", "gpt")
+			headers := http.Header{}
+			headers.Set("X-Session-ID", "existing-session")
+			sessionID, _ := extractSessionIDs(headers, nil, nil)
+			previousKey := sessionBindingKey("codex", sessionID, "gpt")
+			canonicalKey := sessionBindingKey("mixed", sessionID, "gpt")
 			ttl := time.Hour
 			if scenario == "expired" {
 				ttl = -time.Hour
@@ -34,7 +37,7 @@ func TestSessionAffinityRollingUpgradePreservesProviderBinding(t *testing.T) {
 				auths = auths[:1]
 			}
 			selection := &SessionAffinitySelection{}
-			opts := Options{Headers: http.Header{"X-Session-ID": {"existing-session"}}, SessionAffinityScope: "mixed", SessionAffinity: selection}
+			opts := Options{Headers: headers, SessionAffinityScope: "mixed", SessionAffinity: selection}
 			if scenario == "new-child" {
 				opts.Headers.Set("X-Session-ID", "new-child")
 				opts.Headers.Set("X-Parent-Session-ID", "existing-session")
@@ -46,7 +49,8 @@ func TestSessionAffinityRollingUpgradePreservesProviderBinding(t *testing.T) {
 			if scenario == "live" {
 				want, wantKey = "b", previousKey
 			} else if scenario == "new-child" {
-				want, wantKey = "b", sessionBindingKey("mixed", "new-child", "gpt")
+				childID, _ := extractSessionIDs(opts.Headers, nil, nil)
+				want, wantKey = "b", sessionBindingKey("mixed", childID, "gpt")
 			} else if scenario == "no-longer-authorized" {
 				wantKey = previousKey
 			}
@@ -81,9 +85,12 @@ func (s failedPriorBindingStore) LoadSessionBinding(ctx context.Context, key str
 func TestSessionAffinityUpgradeDatabaseFailureDoesNotSelectAnotherAccount(t *testing.T) {
 	cache := NewSessionCache(time.Hour)
 	t.Cleanup(cache.Stop)
-	store := failedPriorBindingStore{SessionAffinityStore: cache, key: sessionBindingKey("codex", "existing-session", "gpt")}
+	headers := http.Header{}
+	headers.Set("X-Session-ID", "existing-session")
+	sessionID, _ := extractSessionIDs(headers, nil, nil)
+	store := failedPriorBindingStore{SessionAffinityStore: cache, key: sessionBindingKey("codex", sessionID, "gpt")}
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Store: store})
-	opts := Options{Headers: http.Header{"X-Session-ID": {"existing-session"}}, SessionAffinityScope: "mixed"}
+	opts := Options{Headers: headers, SessionAffinityScope: "mixed"}
 	picked, err := selector.Pick(t.Context(), "codex", "gpt", opts, []*Auth{{ID: "a", Status: StatusActive}})
 	if picked != nil || err == nil || !strings.Contains(err.Error(), "load prior session affinity binding") {
 		t.Fatalf("database outage must preserve affinity authority: pick=%v err=%v", picked, err)
