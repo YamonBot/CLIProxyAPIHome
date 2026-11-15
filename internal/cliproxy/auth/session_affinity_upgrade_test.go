@@ -10,7 +10,7 @@ import (
 )
 
 func TestSessionAffinityRollingUpgradePreservesProviderBinding(t *testing.T) {
-	for _, scenario := range []string{"live", "expired", "no-longer-authorized", "canonical-wins"} {
+	for _, scenario := range []string{"live", "expired", "no-longer-authorized", "canonical-wins", "new-child"} {
 		t.Run(scenario, func(t *testing.T) {
 			store := NewSessionCache(time.Hour)
 			t.Cleanup(store.Stop)
@@ -35,11 +35,17 @@ func TestSessionAffinityRollingUpgradePreservesProviderBinding(t *testing.T) {
 			}
 			selection := &SessionAffinitySelection{}
 			opts := Options{Headers: http.Header{"X-Session-ID": {"existing-session"}}, SessionAffinityScope: "mixed", SessionAffinity: selection}
-			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Store: store, Fallback: &FillFirstSelector{}})
+			if scenario == "new-child" {
+				opts.Headers.Set("X-Session-ID", "new-child")
+				opts.Headers.Set("X-Parent-Session-ID", "existing-session")
+			}
+			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Store: store, Fallback: &FillFirstSelector{}, SubagentAffinity: true})
 			picked, err := selector.Pick(t.Context(), "codex", "gpt", opts, auths)
 			want, wantKey := "a", canonicalKey
 			if scenario == "live" {
 				want, wantKey = "b", previousKey
+			} else if scenario == "new-child" {
+				want, wantKey = "b", sessionBindingKey("mixed", "new-child", "gpt")
 			} else if scenario == "no-longer-authorized" {
 				wantKey = previousKey
 			}

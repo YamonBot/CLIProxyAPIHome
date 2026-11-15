@@ -576,6 +576,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			if errParent != nil {
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
 			}
+			if parent.Revision == "" && bindingScope != provider && provider != "mixed" {
+				parent, errParent = s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
+				if errParent != nil {
+					return nil, fmt.Errorf("load prior parent session affinity binding: %w", errParent)
+				}
+			}
 			if time.Now().Before(parent.ExpiresAt) {
 				for _, auth := range bindingCandidates {
 					if auth.ID == parent.AuthID {
