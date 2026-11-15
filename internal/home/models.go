@@ -114,10 +114,19 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 
 // registerResolvedModelsForAuth returns a register resolved models for auth.
 func (r *Runtime) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models, candidates []*ModelInfo) {
-	if a == nil || a.ID == "" {
+	if r == nil || a == nil || a.ID == "" {
 		return
 	}
 	registry.GetGlobalRegistry().RegisterClientWithCandidates(a.ID, providerKey, models, candidates)
+	if r.coreManager != nil {
+		modelIDs := make([]string, 0, len(models))
+		for _, model := range models {
+			if model != nil {
+				modelIDs = append(modelIDs, model.ID)
+			}
+		}
+		r.coreManager.SetModelAliasHints(a, modelIDs)
+	}
 }
 
 func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *DispatchModelInfo {
@@ -130,7 +139,19 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 	}
 	seen := make(map[string]struct{}, len(candidates))
 	var selected *ModelInfo
+	// OAuth aliases can override capabilities independently of their upstream.
+	// API-key pools retain the upstream-first lookup below.
+	for _, route := range []string{strings.TrimSpace(routeModel), coreauth.CanonicalModelID(routeModel)} {
+		info := modelRegistry.GetModelInfoForClient(authID, route)
+		if info != nil && info.MetadataModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.MetadataModelID), coreauth.CanonicalModelID(upstreamModel)) {
+			selected = info
+			break
+		}
+	}
 	for _, candidate := range candidates {
+		if selected != nil {
+			break
+		}
 		key := strings.ToLower(strings.TrimSpace(candidate))
 		if key == "" {
 			continue
@@ -169,6 +190,10 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if r == nil || a == nil || a.ID == "" {
 		return
+	}
+	r.cancelStaleAntigravityProbes(a.ID)
+	if r.coreManager != nil {
+		r.coreManager.SetModelAliasHints(a, nil)
 	}
 	if a.Disabled || a.Status == coreauth.StatusDisabled {
 		registry.GetGlobalRegistry().UnregisterClient(a.ID)
@@ -253,7 +278,14 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	case "antigravity":
-		models = registry.GetAntigravityModels()
+		expectedKey := r.antigravityCapabilityKey(a)
+		hints := r.cachedAntigravityHints(a)
+		if hints.ModelIDs != nil {
+			r.applyAntigravityModelHints(context.Background(), a, provider, hints, expectedKey)
+			r.asyncProbeAntigravityCapabilities(context.Background(), a, provider)
+			return
+		}
+		models = applyAntigravityFetchedModelCapabilities(registry.GetAntigravityModels(), hints)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if len(configModels) > 0 {
@@ -452,11 +484,12 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		key = strings.ToLower(strings.TrimSpace(a.Provider))
 	}
 	models = r.appendPluginModels(key, models)
-	candidates := append([]*ModelInfo{}, models...)
-	models = applyExcludedModels(models, excluded)
-	models = applyOAuthModelAlias(cfg, provider, authKind, models)
+	models, candidates := applyOAuthModelConfig(cfg, provider, authKind, models, excluded)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix), candidates)
+	if provider == "antigravity" {
+		r.asyncProbeAntigravityCapabilities(context.Background(), a, key)
+	}
 }
 
 // oauthExcludedModels handles an oauth excluded models.
@@ -1035,6 +1068,9 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			seen[aliasKey] = struct{}{}
 			clone := *model
 			clone.ID = mappedID
+			if clone.MetadataModelID == "" {
+				clone.MetadataModelID = id
+			}
 			if entry.displayName != "" {
 				clone.DisplayName = entry.displayName
 			}

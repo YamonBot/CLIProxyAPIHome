@@ -54,15 +54,33 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	}
 	payload = enrichedPayload
 
-	// Always update scheduler state before queuing persistence so cooldowns are applied even if log persistence fails.
 	if env.Runtime != nil {
-		env.Runtime.RecordUsagePayload(ctx, payload)
-		persisted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
+		persisted, inserted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
 		if errPersist != nil {
+			// Nothing is acknowledged: CPA redelivers and the dedupe key resolves
+			// whether the usage row already committed.
 			log.Errorf("usage database write error: %v", errPersist)
+			return dispatch.Err("usage database write failed")
 		}
 		if persisted {
+			// A deduplicated delivery still applies feedback: the first attempt may
+			// have committed usage but failed before the scheduler update. Replays
+			// of fully processed events are fenced by event time inside MarkResult.
+			var errFeedback error
+			if inserted {
+				errFeedback = env.Runtime.RecordUsagePayload(ctx, payload)
+			} else {
+				errFeedback = env.Runtime.ApplyUsagePayloadFeedback(ctx, payload)
+			}
+			if errFeedback != nil {
+				log.Errorf("usage feedback error: %v", errFeedback)
+				return dispatch.Err("usage feedback failed")
+			}
 			return dispatch.Integer(1)
+		}
+		if errRecord := env.Runtime.RecordUsagePayload(ctx, payload); errRecord != nil {
+			log.Errorf("usage feedback error: %v", errRecord)
+			return dispatch.Err("usage feedback failed")
 		}
 	}
 

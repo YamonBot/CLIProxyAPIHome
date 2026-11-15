@@ -30,9 +30,9 @@ type PGSQLConfig struct {
 	Passowrd           string        `yaml:"passowrd"`
 	Database           string        `yaml:"database"`
 	SSLMode            string        `yaml:"sslmode"`
-	SlowQueryThreshold time.Duration `yaml:"slow-query-threshold"`
-	MaxOpenConns       *int          `yaml:"max-open-conns"`
+	MaxOpenConns       int           `yaml:"max-open-conns"`
 	MaxIdleConns       *int          `yaml:"max-idle-conns"`
+	SlowQueryThreshold time.Duration `yaml:"slow-query-threshold"`
 }
 
 type SQLiteConfig struct {
@@ -229,15 +229,16 @@ func (c PGSQLConfig) Configured() bool {
 
 // Validate validates validate.
 func (c PGSQLConfig) Validate() error {
-	maxOpen, maxIdle := c.poolLimits()
-	if maxOpen <= 0 {
-		return fmt.Errorf("pgsql.max-open-conns must be greater than 0")
+	if c.MaxOpenConns < 0 {
+		return fmt.Errorf("pgsql.max-open-conns must not be negative")
 	}
-	if maxIdle < 0 {
-		return fmt.Errorf("pgsql.max-idle-conns must not be negative")
-	}
-	if maxIdle > maxOpen {
-		return fmt.Errorf("pgsql.max-idle-conns must not exceed max-open-conns")
+	if c.MaxIdleConns != nil {
+		if *c.MaxIdleConns < 0 {
+			return fmt.Errorf("pgsql.max-idle-conns must not be negative")
+		}
+		if c.MaxOpenConns > 0 && *c.MaxIdleConns > c.MaxOpenConns {
+			return fmt.Errorf("pgsql.max-idle-conns must not exceed pgsql.max-open-conns when the maximum is limited")
+		}
 	}
 	if strings.TrimSpace(c.PostgresURI) != "" {
 		if strings.TrimSpace(c.Host) != "" ||
@@ -267,18 +268,6 @@ func (c PGSQLConfig) Validate() error {
 		return fmt.Errorf("pgsql.database is required")
 	}
 	return nil
-}
-
-func (c PGSQLConfig) poolLimits() (int, int) {
-	maxOpen := defaultPostgresMaxOpenConns
-	if c.MaxOpenConns != nil {
-		maxOpen = *c.MaxOpenConns
-	}
-	maxIdle := min(defaultPostgresMaxIdleConns, maxOpen)
-	if c.MaxIdleConns != nil {
-		maxIdle = *c.MaxIdleConns
-	}
-	return maxOpen, maxIdle
 }
 
 // Configured reports whether SQLite has cluster database settings.

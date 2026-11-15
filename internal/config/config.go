@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -31,6 +32,9 @@ var ErrInvalidProviderCredentialID = errors.New("provider credential id must be 
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
+	// RawConfig is the complete submitted configuration, not an execution-field remainder.
+	// Runtime fields below are a read projection; configuration writes update the tree.
+	RawConfig map[string]any `yaml:"-" json:"-"`
 	// Models selects optional catalog sources independently for each catalog.
 	Models ModelCatalogs `yaml:"models" json:"models"`
 
@@ -40,6 +44,9 @@ type Config struct {
 	Host string `yaml:"host" json:"-"`
 	// Port is the CPA server port distributed by Home.
 	Port int `yaml:"port" json:"-"`
+
+	// OAuth model capabilities are owned and published by Home.
+	OAuthSettings map[string][]OAuthModelSetting `yaml:"oauth-settings,omitempty" json:"oauth-settings,omitempty"`
 
 	// AllowHost limits RESP client connections to the listed IP addresses.
 	// Empty means all client hosts are allowed.
@@ -224,8 +231,15 @@ type CodexHeaderDefaults struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
-	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
+	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
+	// SensitiveWords is a list of words to obfuscate in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+
+	// SensitiveWordsReplace maps target substrings to literal replacement text in system instructions.
+	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
+
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system instructions.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 
 	// Settings shared with CPA V8.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
@@ -311,6 +325,8 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	// SessionAffinityRebindOn controls failover binding changes: any, quota, or never.
+	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
@@ -326,7 +342,10 @@ type RoutingConfig struct {
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 
-	// Settings shared with CPA V8.
+	// SessionAffinitySubagents controls initial parent-credential inheritance for child sessions.
+	// Guardian children may inherit the parent's latest eligible selection across models.
+	// Defaults to true; ignored when SessionAffinity is false. Existing child bindings,
+	// conversational forks, compaction, and content-hash fallbacks are unaffected.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
 }
 
@@ -342,6 +361,8 @@ type OAuthModelAlias struct {
 
 	// Settings shared with CPA V8.
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
+	// OpenAPI selects the Vertex execution endpoint without changing Home alias resolution.
+	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
@@ -413,6 +434,12 @@ type CloakConfig struct {
 	// This can help bypass certain content filters.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 
+	// SensitiveWordsReplace maps target substrings to literal replacement text when cloaking.
+	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
+
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules when cloaking.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
+
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.
 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
@@ -421,6 +448,7 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -525,6 +553,7 @@ func (m ClaudeModel) GetMaxContextLength() int { return m.MaxContextLength }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -643,6 +672,7 @@ type MetaModel = CodexModel
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -738,6 +768,7 @@ func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable identity of the fallback credential when no API key entries exist.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -782,6 +813,7 @@ type OpenAICompatibility struct {
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
 type OpenAICompatibilityAPIKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -897,6 +929,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if secretChanged {
 		cfg.RemoteManagement.SecretKey = normalizedSecret
+		// Secret normalization is an explicit Home-owned tree update, not a
+		// serialization of the runtime projection back into the full document.
+		for _, section := range []string{"management", "remote-management"} {
+			if management, ok := cfg.RawConfig[section].(map[string]any); ok {
+				management["secret-key"] = normalizedSecret
+				break
+			}
+		}
 		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
 		// Preserve YAML comments and ordering; update only the nested key.
 		secretPath := []string{"remote-management", "secret-key"}
@@ -979,8 +1019,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
-	// Sanitize Antigravity configuration.
+	// Sanitize Antigravity and Devin configurations.
 	cfg.SanitizeAntigravity()
+	cfg.SanitizeDevin()
 
 	ForceHomeRuntimeConfig(&cfg)
 
@@ -1077,19 +1118,42 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 }
 
-// SanitizeAntigravity trims surrounding whitespace and drops empty words from Antigravity sensitive words.
+// SanitizeAntigravity trims surrounding whitespace and drops empty entries from Antigravity sensitive-word settings.
 func (cfg *Config) SanitizeAntigravity() {
-	if cfg == nil || len(cfg.Antigravity.SensitiveWords) == 0 {
+	if cfg == nil {
 		return
 	}
-	cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
-	for _, word := range cfg.Antigravity.SensitiveWords {
-		word = strings.TrimSpace(word)
-		if word != "" {
-			cleaned = append(cleaned, word)
+	if len(cfg.Antigravity.SensitiveWords) > 0 {
+		cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
+		for _, word := range cfg.Antigravity.SensitiveWords {
+			word = strings.TrimSpace(word)
+			if word != "" {
+				cleaned = append(cleaned, word)
+			}
 		}
+		cfg.Antigravity.SensitiveWords = cleaned
 	}
-	cfg.Antigravity.SensitiveWords = cleaned
+	cfg.Antigravity.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Antigravity.SensitiveWordsReplace)
+	cfg.Antigravity.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Antigravity.SensitivePatternsReplace)
+}
+
+// SanitizeDevin trims surrounding whitespace and drops empty entries from Devin sensitive-word settings.
+func (cfg *Config) SanitizeDevin() {
+	if cfg == nil {
+		return
+	}
+	if len(cfg.Devin.SensitiveWords) > 0 {
+		cleaned := make([]string, 0, len(cfg.Devin.SensitiveWords))
+		for _, word := range cfg.Devin.SensitiveWords {
+			word = strings.TrimSpace(word)
+			if word != "" {
+				cleaned = append(cleaned, word)
+			}
+		}
+		cfg.Devin.SensitiveWords = cleaned
+	}
+	cfg.Devin.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Devin.SensitiveWordsReplace)
+	cfg.Devin.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Devin.SensitivePatternsReplace)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1122,12 +1186,18 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 				continue
 			}
 			seenAlias[aliasKey] = struct{}{}
+			var openAPI *bool
+			if channel == "vertex" && entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
 			clean = append(clean, OAuthModelAlias{
 				Name:         name,
 				Alias:        alias,
 				Fork:         entry.Fork,
 				DisplayName:  strings.TrimSpace(entry.DisplayName),
 				ForceMapping: entry.ForceMapping,
+				OpenAPI:      openAPI,
 			})
 		}
 		if len(clean) > 0 {
@@ -1331,7 +1401,33 @@ func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
 	return out
 }
 
-// SanitizeClaudeKeys normalizes headers for Claude credentials.
+// NormalizeCloakConfig trims strings and removes blank sensitive words.
+func NormalizeCloakConfig(cloak *CloakConfig) *CloakConfig {
+	if cloak == nil {
+		return nil
+	}
+	cloak.Mode = strings.TrimSpace(cloak.Mode)
+	if len(cloak.SensitiveWords) > 0 {
+		normalizedWords := make([]string, 0, len(cloak.SensitiveWords))
+		for _, w := range cloak.SensitiveWords {
+			if trimmed := strings.TrimSpace(w); trimmed != "" {
+				normalizedWords = append(normalizedWords, trimmed)
+			}
+		}
+		if len(normalizedWords) > 0 {
+			cloak.SensitiveWords = normalizedWords
+		} else {
+			cloak.SensitiveWords = nil
+		}
+	} else {
+		cloak.SensitiveWords = nil
+	}
+	cloak.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cloak.SensitiveWordsReplace)
+	cloak.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cloak.SensitivePatternsReplace)
+	return cloak
+}
+
+// SanitizeClaudeKeys normalizes headers and cloak settings for Claude credentials.
 func (cfg *Config) SanitizeClaudeKeys() {
 	if cfg == nil || len(cfg.ClaudeKey) == 0 {
 		return
@@ -1341,11 +1437,12 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.Cloak = NormalizeCloakConfig(entry.Cloak)
 	}
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
-// It uses API key, base URL, proxy URL, prefix, and custom headers as the uniqueness key.
+// Distinct scheduling, model, and CPA execution options remain separate credentials.
 func (cfg *Config) SanitizeGeminiKeys() {
 	// Keep validation before state changes so failures leave existing data intact.
 	if cfg == nil {
@@ -1397,6 +1494,14 @@ func formatGeminiKeyDedupID(entry GeminiKey) string {
 	b.WriteString(entry.Prefix)
 	b.WriteByte(0)
 	b.WriteString(FormatSortedHeaders(entry.Headers))
+	b.WriteByte(0)
+	raw, _ := yaml.Marshal(entry)
+	var options map[string]any
+	_ = yaml.Unmarshal(raw, &options)
+	delete(options, "id")
+	delete(options, "uuid")
+	encoded, _ := json.Marshal(options)
+	b.Write(encoded)
 	return b.String()
 }
 
@@ -1448,6 +1553,64 @@ func NormalizeRemoteManagementSecret(secret string) (string, bool, error) {
 		return "", false, errHash
 	}
 	return hashed, true, nil
+}
+
+// NormalizeSensitiveWordsReplace trims replacement target keys, drops blank keys,
+// and preserves replacement values (including empty strings for phrase deletion).
+func NormalizeSensitiveWordsReplace(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(in))
+	for _, rawKey := range keys {
+		trimmedKey := strings.TrimSpace(rawKey)
+		if trimmedKey == "" {
+			continue
+		}
+		if _, exists := out[trimmedKey]; exists && rawKey != trimmedKey {
+			continue
+		}
+		out[trimmedKey] = in[rawKey]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeSensitivePatternsReplace validates Go RE2 regex rules, logs and drops
+// invalid or blank patterns, and preserves replacement values (including empty strings).
+func NormalizeSensitivePatternsReplace(in []SensitivePatternRule) []SensitivePatternRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]SensitivePatternRule, 0, len(in))
+	for i, rule := range in {
+		if strings.TrimSpace(rule.Pattern) == "" {
+			continue
+		}
+		if _, errCompile := regexp.Compile(rule.Pattern); errCompile != nil {
+			log.WithFields(log.Fields{
+				"rule_index": i + 1,
+				"pattern":    rule.Pattern,
+				"error":      errCompile,
+			}).Warn("sensitive-patterns-replace rule dropped: invalid regex")
+			continue
+		}
+		out = append(out, SensitivePatternRule{
+			Pattern:     rule.Pattern,
+			Replacement: rule.Replacement,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // NormalizeHeaders trims header keys and values and removes empty pairs.

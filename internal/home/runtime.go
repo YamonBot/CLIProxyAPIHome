@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
@@ -60,10 +61,17 @@ type Runtime struct {
 	clusterRefresh          func(context.Context, string, string) ([]byte, error)
 	originalStore           coreauth.Store
 
-	clusterUsageQueueMu sync.Mutex
-	clusterUsageQueue   *usagePayloadQueue
-
 	cancel context.CancelFunc
+
+	antigravityProbeMu        sync.Mutex
+	antigravityProbeWg        sync.WaitGroup
+	antigravityAccountProbes  map[string]map[*antigravityAccountProbe]struct{}
+	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
+	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+	antigravityPersistPending map[string]*antigravityHintPersistRequest
+	antigravityRefreshWake    chan struct{}
+	antigravityContext        context.Context
+	antigravityCancel         context.CancelFunc
 
 	fileWatcher interface{ Stop() error }
 }
@@ -175,7 +183,7 @@ type clusterAuthStateObserver interface {
 }
 
 type clusterUsageStore interface {
-	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
+	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
 }
 
 type appLogStore interface {
@@ -344,7 +352,12 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
-	r.startClusterUsageWriter(runCtx)
+	r.cfgMu.Lock()
+	if r.antigravityCancel != nil {
+		r.antigravityCancel()
+	}
+	r.antigravityContext, r.antigravityCancel = runCtx, cancel
+	r.cfgMu.Unlock()
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -353,6 +366,8 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	}
 
 	registry.StartModelCatalogUpdaters(runCtx, r.Config().Models)
+	cpasdkauth.StartAntigravityVersionUpdater(runCtx)
+	go r.runAntigravityModelRefresh(runCtx)
 	r.registerModelRefreshCallback()
 	managementasset.SetCurrentConfig(r.cfg)
 	managementasset.StartAutoUpdater(context.Background(), configPath)
@@ -389,11 +404,20 @@ func (r *Runtime) Stop() {
 	if r == nil {
 		return
 	}
+	r.cfgMu.Lock()
+	antigravityCancel := r.antigravityCancel
+	r.antigravityCancel = nil
+	stoppedCtx, stopAntigravity := context.WithCancel(context.Background())
+	stopAntigravity()
+	r.antigravityContext = stoppedCtx
+	r.cfgMu.Unlock()
+	if antigravityCancel != nil {
+		antigravityCancel()
+	}
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
 	}
-	r.stopClusterUsageWriter()
 	if r.fileWatcher != nil {
 		_ = r.fileWatcher.Stop()
 		r.fileWatcher = nil
@@ -402,6 +426,8 @@ func (r *Runtime) Stop() {
 		r.pluginHost.ShutdownAll()
 	}
 	r.StopAutoRefresh()
+	r.cancelStaleAntigravityProbes("")
+	r.WaitAntigravityProbes()
 	if r.coreManager != nil {
 		r.coreManager.Shutdown()
 	}
@@ -481,7 +507,7 @@ func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex, observ
 	if errRefresh != nil {
 		return nil, errRefresh
 	}
-	return BuildRefreshPayload(updated)
+	return BuildRefreshPayload(updated, r.Config())
 }
 
 // UpdateAuthInMemory updates an auth in memory.
@@ -538,19 +564,24 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 	return refresher.RefreshAuthIndex(ctx, uuid)
 }
 
-// PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
-func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
+// PersistClusterUsagePayload stores a cluster usage payload with its trusted
+// receive time. It reports whether the cluster store handled the payload and
+// whether the payload was newly inserted (false when deduplicated).
+func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (persisted bool, inserted bool, err error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
-		return false, nil
+		return false, false, nil
 	}
-	queue := r.getClusterUsageQueue()
-	if queue == nil {
-		return true, nil
+	store, ok := r.clusterAdapter.(clusterUsageStore)
+	if !ok || store == nil {
+		return false, false, fmt.Errorf("cluster usage store is unavailable")
 	}
-	if ok := queue.Push(payload, receivedAt); !ok {
-		log.Warnf("cluster usage queue is stopped; accepting usage without persistence")
+	// Acknowledge usage only after its database transaction commits. A failed
+	// write must reach the sender, not disappear from an in-memory queue.
+	inserted, errStore := store.StoreUsagePayload(ctx, payload, receivedAt)
+	if errStore != nil {
+		return false, false, errStore
 	}
-	return true, nil
+	return true, inserted, nil
 }
 
 // PersistAppLogPayload stores a CPA app log payload in the runtime database.
@@ -683,12 +714,15 @@ func (r *Runtime) ListPendingPluginTasks(ctx context.Context, nodeType string, n
 }
 
 // BuildRefreshPayload builds a build refresh payload.
-func BuildRefreshPayload(updated *coreauth.Auth) ([]byte, error) {
+func BuildRefreshPayload(updated *coreauth.Auth, cfg *config.Config) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if updated == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	auth := SanitizeAuthForDownstream(updated)
+	auth, errSanitize := SanitizeAuthForDownstream(updated, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	if auth == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
@@ -872,25 +906,14 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey, reqModel)
 	if errAllowed != nil {
-		return nil, errAllowed
-	}
-	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
-	if pinnedAuthID != "" {
-		pinnedAllowed := allowedAuthIDs == nil
-		for _, allowedAuthID := range allowedAuthIDs {
-			if strings.TrimSpace(allowedAuthID) == pinnedAuthID {
-				pinnedAllowed = true
-				break
-			}
-		}
-		allowedAuthIDs = []string{}
-		if pinnedAllowed {
-			allowedAuthIDs = append(allowedAuthIDs, pinnedAuthID)
-		}
+		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
 	metadata := make(map[string]any)
 	if allowedAuthIDs != nil {
 		metadata[coreauth.AllowedAuthIDsMetadataKey] = allowedAuthIDs
+	}
+	if pinnedAuthID = strings.TrimSpace(pinnedAuthID); pinnedAuthID != "" {
+		metadata[coreauth.PinnedAuthIDMetadataKey] = pinnedAuthID
 	}
 	if allowedModelIDs != nil {
 		metadata[coreauth.AllowedModelIDsMetadataKey] = allowedModelIDs
@@ -907,7 +930,8 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
 	}
-	return r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	result, errDispatch := r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	return result, r.withModelAliasHint(ctx, errDispatch, reqModel, apiKey)
 }
 
 func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
@@ -930,6 +954,23 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("home runtime: no providers available")
 	}
+	for _, provider := range providers {
+		if provider != "antigravity" {
+			continue
+		}
+		until, errPause := r.antigravityTOSPauseDeadline(ctx)
+		if errPause != nil {
+			return nil, fmt.Errorf("read Antigravity pool pause: %w", errPause)
+		}
+		if until.After(time.Now()) {
+			// Keep the provider scope stable for session affinity; only fence candidates.
+			opts.ExcludedProviders = append(append([]string(nil), opts.ExcludedProviders...), "antigravity")
+			if len(providers) == 1 {
+				return nil, &coreauth.Error{Code: "antigravity_tos_pause", Message: "Antigravity credential pool is paused", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
+			}
+		}
+		break
+	}
 
 	if !r.supportsRequestedModel(reqModel) {
 		trimmedModel := strings.TrimSpace(reqModel)
@@ -942,19 +983,16 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
-	// Database-backed admissions commit the binding and the concurrency counter
-	// in one transaction. Standalone dispatch without a limiter can CAS directly.
-	// Legacy custom admitters without a shared store retain selector-side commits.
-	if r.concurrencyAdmitter == nil || r.sessionAffinityStore != nil {
-		opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
-	}
+	// Database-backed admissions commit the binding and concurrency counter in
+	// one transaction. Local/custom stores are committed separately below, but
+	// weighted reservations always remain owned by dispatch until admission ends.
+	opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
+	defer func() { opts.SessionAffinity.Finish(false) }()
 	var lastCandidateError error
 	for {
+		opts.SessionAffinity.Reset()
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
-		}
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = coreauth.SessionAffinitySelection{}
 		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
@@ -1003,8 +1041,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if opts.SessionAffinity != nil {
 			binding = opts.SessionAffinity.Commit
 		}
-		// Explicitly installed local/custom selectors cannot participate in the
-		// database admission transaction. Keep their selector-side CAS behavior.
+		// Local/custom stores cannot participate in the database admission
+		// transaction. Commit their binding before admission instead.
 		if binding != nil && r.concurrencyAdmitter != nil && opts.SessionAffinity.Store != r.sessionAffinityStore {
 			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
 			if errSwap != nil {
@@ -1045,6 +1083,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				if !admission.Accounted {
 					return nil, fmt.Errorf("home runtime: concurrency admission result mismatch")
 				}
+				opts.SessionAffinity.Finish(true)
 				result.Concurrency.Accounted = true
 				result.AdmissionFenceFailure = fmt.Errorf("home runtime: concurrency admission result mismatch")
 				return result, nil
@@ -1059,6 +1098,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				continue
 			}
 		}
+		opts.SessionAffinity.Finish(true)
 		return result, nil
 	}
 }
@@ -1149,6 +1189,44 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 		allowedModelIDs = modelIDs
 	}
 	return allowedAuthIDs, allowedModelIDs, nil
+}
+
+// withModelAliasHint preserves the original lookup error and adds only aliases
+// visible to this API key. Policy failures omit the optional hint.
+func (r *Runtime) withModelAliasHint(ctx context.Context, err error, reqModel, apiKey string) error {
+	if err == nil || r == nil || r.coreManager == nil {
+		return err
+	}
+	authErr, structured := err.(*coreauth.Error)
+	code := ""
+	if structured {
+		if authErr == nil || authErr.Upstream != nil {
+			return err
+		}
+		code = authErr.Code
+	} else {
+		code, _ = homeerrors.SplitRedisErrorMessage(err.Error())
+	}
+	if code != homeerrors.TypeAuthNotFound && code != homeerrors.TypeModelNotFound {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	policy, errPolicy := r.ModelAccessForAPIKey(ctx, apiKey)
+	if errPolicy != nil {
+		return err
+	}
+	hint := coreauth.ModelAliasHint(reqModel, r.coreManager.AliasesForUpstreamModel(reqModel, policy))
+	if hint == "" {
+		return err
+	}
+	if !structured {
+		return fmt.Errorf("%w; %s", err, hint)
+	}
+	annotated := *authErr
+	annotated.Message = strings.TrimSpace(annotated.Message) + "; " + hint
+	return &annotated
 }
 
 // supportsRequestedModel handles a supports requested model.

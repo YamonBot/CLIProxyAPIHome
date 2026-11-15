@@ -106,11 +106,13 @@ type Manager struct {
 	store    Store
 	selector Selector
 
-	mu          sync.RWMutex
-	updateLocks authUpdateLocks
-	auths       map[string]*Auth
-	indexAuth   map[string]*Auth
-	scheduler   *authScheduler
+	mu              sync.RWMutex
+	updateLocks     authUpdateLocks
+	auths           map[string]*Auth
+	indexAuth       map[string]*Auth
+	scheduler       *authScheduler
+	modelAliasHints modelAliasHintIndex
+	usageStats      usageRequestStatsCache
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -362,6 +364,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	delete(m.auths, id)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(id, nil)
 
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
@@ -690,6 +693,7 @@ func (m *Manager) removeAuthLocked(authID string) {
 	delete(m.auths, authID)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(authID, nil)
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(authID)
 	}
@@ -1103,9 +1107,6 @@ func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
 				suspendReason = strings.TrimSpace(state.StatusMessage)
 			}
 		}
-		// Recreate the suspension so a transition from quota to another error
-		// also updates the registry reason.
-		modelRegistry.ResumeClientModel(auth.ID, registryModel)
 		modelRegistry.SuspendClientModel(auth.ID, registryModel, suspendReason)
 	}
 }
@@ -1122,7 +1123,7 @@ func shouldSuspendRegistryModel(auth *Auth, model string, reason blockReason) bo
 	if state == nil {
 		return false
 	}
-	if isModelSupportResultError(state.LastError) {
+	if isModelSupportResultError(state.LastError) || isForceCooldownResultError(state.LastError) {
 		return true
 	}
 	switch statusCodeFromResult(state.LastError) {
@@ -1323,6 +1324,12 @@ func (m *Manager) useSchedulerFastPath() bool {
 
 // Dispatch processes dispatch.
 func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedModel string, opts Options) (*DispatchDecision, error) {
+	selectionReturned := false
+	defer func() {
+		if !selectionReturned {
+			opts.SessionAffinity.Finish(false)
+		}
+	}()
 	// Build the candidate view before applying availability rules.
 	if m == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "manager is nil"}
@@ -1330,9 +1337,32 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if len(providers) == 0 {
+	normalizedProviders := normalizeProviderKeys(providers)
+	if len(normalizedProviders) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	// Home session bindings have a stable cross-provider scope. Keep it
+	// separate from the current provider set used for selection and accounting.
+	opts.SessionAffinityScope = "mixed"
+	providerForSelector := "mixed"
+	if len(normalizedProviders) == 1 {
+		providerForSelector = normalizedProviders[0]
+	}
+	requestedProviders := normalizedProviders
+	if len(opts.ExcludedProviders) > 0 {
+		excluded := normalizeProviderKeys(opts.ExcludedProviders)
+		eligible := make([]string, 0, len(normalizedProviders))
+		for _, provider := range normalizedProviders {
+			if !containsProvider(excluded, provider) {
+				eligible = append(eligible, provider)
+			}
+		}
+		normalizedProviders = eligible
+	}
+	if len(normalizedProviders) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no provider available"}
+	}
+	providers = normalizedProviders
 
 	routeModel := strings.TrimSpace(requestedModel)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
@@ -1405,25 +1435,29 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	}
 
 	filterWeights := !m.hasPluginScheduler()
+	unpinnedAllowedAuthIDs := unpinnedAllowedAuthIDsFromOptions(opts)
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
-	normalizedProviders := normalizeProviderKeys(providers)
-	if len(normalizedProviders) == 0 {
-		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-	providerForSelector := "mixed"
-	if len(normalizedProviders) == 1 {
-		providerForSelector = normalizedProviders[0]
-	}
+	pinnedAuthID := pinnedAuthIDFromOptions(opts)
 	registryRef := registry.GetGlobalRegistry()
 
 	tried := cloneAuthIDSet(excludedAuthIDs)
 	for {
+		opts.SessionAffinity.Reset()
 		now := time.Now()
 		m.mu.RLock()
 		selector := m.selector
 		pluginScheduler := m.pluginScheduler
+		trackPinnedAccounting := pinnedAuthID != "" && filterWeights && isWeightedSelector(selector)
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
+		var transientAuthIDs map[string]struct{}
+		if affinity, ok := selector.(*SessionAffinitySelector); ok && affinity.rebindOn == "quota" {
+			transientAuthIDs = make(map[string]struct{})
+		}
+		var accountingAuths []*Auth
+		if trackPinnedAccounting {
+			accountingAuths = make([]*Auth, 0, len(m.auths))
+		}
 		totalCandidates := 0
 		cooldownCount := 0
 		var earliest time.Time
@@ -1434,29 +1468,50 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if filterWeights && isWeightedSelector(selector) && authWeight(candidate) <= 0 {
 				continue
 			}
-			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
+			if !authAllowedByID(candidate.ID, unpinnedAllowedAuthIDs) {
 				continue
 			}
-			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
-				continue
-			}
-			if !authAllowedByID(candidate.ID, allowedAuthIDs) {
+			if !trackPinnedAccounting && !authAllowedByID(candidate.ID, allowedAuthIDs) {
 				continue
 			}
 			providerKey := strings.ToLower(strings.TrimSpace(candidate.Provider))
 			if providerKey == "" {
 				continue
 			}
-			if !containsProvider(normalizedProviders, providerKey) {
+			if !containsProvider(requestedProviders, providerKey) {
 				continue
 			}
 			if routeKey != "" && (registryRef == nil || !registryRef.ClientSupportsModel(candidate.ID, routeKey)) {
 				continue
 			}
-			totalCandidates++
+			pinnedAllowed := authAllowedByID(candidate.ID, allowedAuthIDs)
+			if transientAuthIDs != nil && pinnedAllowed && credentialPolicyAllows(credentialPolicy, candidate) {
+				resolved := m.resolveDispatchModel(candidate, routeModel)
+				if resolved.Model != "" {
+					availabilityAuth := m.effectiveAvailabilityAuth(candidate, now)
+					blockedModel, _, _, _ := dispatchModelBlockStatus(availabilityAuth, resolved.Key, routeModel, now)
+					if !sessionAffinityQuotaBlocked(availabilityAuth, blockedModel, now) {
+						transientAuthIDs[candidate.ID] = struct{}{}
+					}
+				}
+			}
+			// Pool pauses constrain selection, not protection of a healthy binding.
+			if !containsProvider(normalizedProviders, providerKey) {
+				continue
+			}
+			// Retry limits constrain this attempt, not the session binding lifetime.
+			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
+				continue
+			}
+			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
+				continue
+			}
+			if pinnedAllowed {
+				totalCandidates++
+			}
 			dispatchCandidate, okCandidate, reason, next := m.buildDispatchCandidate(candidate, providerKey, routeModel, credentialPolicy, now)
 			if !okCandidate {
-				if reason == blockReasonCooldown {
+				if pinnedAllowed && reason == blockReasonCooldown {
 					cooldownCount++
 					if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 						earliest = next
@@ -1465,6 +1520,13 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				continue
 			}
 			if concurrencyCandidateExcluded(opts, candidate.ID, dispatchCandidate.upstreamKey) {
+				continue
+			}
+			// Pinning restricts selection, not the eligible pool used for accounting.
+			if trackPinnedAccounting {
+				accountingAuths = append(accountingAuths, dispatchCandidate.availabilityAuth)
+			}
+			if !pinnedAllowed {
 				continue
 			}
 			dispatchCandidates = append(dispatchCandidates, dispatchCandidate)
@@ -1477,9 +1539,6 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
 		}
 
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = SessionAffinitySelection{}
-		}
 		var auth *Auth
 		if pluginScheduler != nil {
 			pluginAuth, handled, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths)
@@ -1502,8 +1561,15 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				}
 			}
 			if auth == nil {
+				selectorCtx := ctx
+				if transientAuthIDs != nil {
+					selectorCtx = context.WithValue(selectorCtx, sessionAffinityTransientAuthIDsKey{}, transientAuthIDs)
+				}
+				if len(accountingAuths) > 0 {
+					selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
+				}
 				var errPick error
-				auth, errPick = selector.Pick(ctx, providerForSelector, selectionArgForSelector(selector, routeModel), opts, availableAuths)
+				auth, errPick = selector.Pick(selectorCtx, providerForSelector, selectionArgForSelector(selector, routeModel), opts, availableAuths)
 				if errPick != nil {
 					return nil, errPick
 				}
@@ -1551,6 +1617,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		if upstream == "" {
 			upstream = routeModel
 		}
+		selectionReturned = true
 		return &DispatchDecision{
 			Auth:          fullAuth.Clone(),
 			Provider:      providerKey,
@@ -2997,7 +3064,7 @@ func isRefreshAcquisitionError(authErr *Error) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
-	case refreshTransientErrorCode, refreshUnsupportedCode:
+	case refreshTransientErrorCode, refreshUnsupportedCode, ErrorCodeRefreshOutcomeUnknown:
 		return true
 	default:
 		return false

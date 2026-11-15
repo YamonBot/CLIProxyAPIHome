@@ -259,6 +259,8 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 返回持久化 Home 配置和数据库中上游 API Key 凭证的规范化 v8 视图，包含 `config-version: 8`。这是持久化配置视图，不保证列出所有运行时默认值；未配置的可选字段可以省略。读取响应设置 `Cache-Control: no-store`。
 
+v8 配置 GET（包括子树和 YAML）读取已提交数据，不初始化生命周期配置，也不对其加行锁。初始化和生命周期校验在启动阶段完成；生命周期记录缺失时返回 `500 config_load_failed`，不会在读取时创建默认值。
+
 响应节选：
 
 ```json
@@ -351,7 +353,7 @@ JSON 写入仅在新旧 ICE server 的 `urls` 列表内容和顺序相同时保�
 
 只读路径为 `credentials/concurrency/lifecycle-config-revision`、`credentials/concurrency/observation-barrier-revision` 和 `plugins/auth-revision`。替换包含这些字段的对象时，必须保留它们当前是否存在以及对应的值；直接设置或删除会被拒绝。
 
-Home 将 `observability.usage.usage-statistics-enabled` 规范化为 `true`，将 `oauth.providers.aistudio.ws-auth` 规范化为 `false`。`routing.cooldown.disable-cooling` 仍控制 Home 本地调度冷却，下发给 CPA 的配置独立强制关闭 CPA 本地冷却。`server.port` 配置的是 CPA，运行中的 CPA 需重启才重新绑定端口；Home 监听仍使用 `-addr` 或 `cluster.yaml` 的 `node.port`。`oauth.auth-dir` 仍是导入导出路径，不是运行时文件写入位置。
+Home 将 `observability.usage.usage-statistics-enabled` 规范化为 `true`。旧的 `oauth.providers.aistudio.ws-auth` 仅为兼容保留并规范化为 `false`，不再下发；CPA 在 Home 模式下不提供 `/v1/ws`。`routing.cooldown.disable-cooling` 仍控制 Home 本地调度冷却，下发给 CPA 的配置独立强制关闭 CPA 本地冷却。`server.port` 配置的是 CPA，运行中的 CPA 需重启才重新绑定端口；Home 监听仍使用 `-addr` 或 `cluster.yaml` 的 `node.port`。`oauth.auth-dir` 仍是导入导出路径，不是运行时文件写入位置。
 
 ### 模型目录来源
 
@@ -379,7 +381,13 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 `PATCH /config/oauth/providers/antigravity` 请求体示例：
 
 ```json
-{ "sensitive-words": ["API", "proxy"], "connection-pool": { "enabled": true } }
+{
+  "sensitive-words": ["API", "proxy"],
+  "sensitive-words-replace": {
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+  },
+  "connection-pool": { "enabled": true }
+}
 ```
 
 `oauth.providers` 下的设置仅作用于 OAuth。API Key 凭证使用自己的分组/key 选项，不会隐式继承 v8 OAuth provider 配置。
@@ -397,6 +405,33 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 Home 在数据库和下发配置中保留兼容的
 运行时字段投影，让当前依赖的 CPA SDK 也能消费共享值。
 
+#### Home 策略与 CPA 执行配置
+
+现有配置接口也支持下列字段。所有值均持久化到数据库，并在配置读取和导入导出中保留。显式的 `false`、`0`、空集合和 `null` 会原样保留，SDK 默认值不会回写。CPA 执行字段依据 Home 当前依赖的 CPA SDK 版本校验，因此升级 SDK 通常即可支持新选项，无需改动 Home；未知字段仍被拒绝。标为 CPA 的配置仅由 Home 保存和下发，不会作用于 Home 自身的 HTTP 服务或上游连接；旧 CPA 节点可能忽略尚未支持的选项。
+
+| 范围 | 字段 |
+| --- | --- |
+| Home 调度 | `routing.session-affinity-rebind-on`；`oauth.providers.antigravity.tos-pause-window` |
+| Home 模型目录 | `oauth.settings.<provider>[]`（`name`、可选 `alias`、`max-context-length`） |
+| CPA 服务 | `server.max-request-body-bytes`、`server.response-compression.enabled/min-bytes`、`server.shutdown-timeout`、`server.github-token` |
+| CPA 客户端兼容 | `client.codex.enable-apply-patch`、`client.codex.web-search-result-cache.enabled/ttl/limit`、`client.claude.show-codex-commentary` |
+| CPA Codex 执行 | `upstream.codex.upstream-request-compression`、`upstream.codex.upstream-request-compression-min-bytes`、`upstream.codex.websocket-compression`；`oauth.providers.codex.signin-with-chatgpt-identifier` |
+| CPA Claude 执行 | `upstream.claude.server-side-fallback`、`upstream.claude.session-date-pin-days`（仅内存模式；使用 Home KV 时忽略）；`upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA 提示词策略 | `oauth.providers.antigravity.sensitive-patterns-replace`、`oauth.providers.devin.sensitive-patterns-replace`、`api-keys.claude[].keys[].cloak.sensitive-patterns-replace`；按顺序执行的 `{pattern, replacement}` Go RE2 规则 |
+| 凭证执行选项 | `api-keys.<provider>[].connection-pool`（组级和单 Key）；`api-keys.vertex[].interactions`；`api-keys.vertex[].models[].openapi`；`oauth.model-alias.vertex[].openapi` |
+
+`routing.session-affinity-rebind-on` 控制已绑定凭证不可用时的切换行为：`any`（默认）在任何切换时重新绑定；`quota` 在临时故障时保留原绑定，仅在配额、认证或模型支持错误时重绑；`never` 拒绝从仍有效的绑定切换。可用提供商变化不会改变会话绑定作用域：禁用已绑定提供商的最后一个凭证时，`never` 会拒绝调度；启用其他提供商也不会替换健康绑定。过期绑定始终可以重新选择。重绑定只依据请求模型的当前故障或凭证级阻断；`quota` 下临时的并发避让或重试排除不会触发重绑。
+
+`tos-pause-window` 在 Home 中默认 `0`（关闭）。省略或留空时显式下发 `"0"`，避免 CPA 节点回退到自身默认值；显式非空值保持不变。设置 `6h` 等正时长可启用；设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
+
+`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。匹配 `alias` 的条目优先于匹配原名 `name` 的条目。不影响 API Key 模型。
+
+`connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
+
+`api-keys.vertex[].models[].openapi` 和 `oauth.model-alias.vertex[].openapi` 的显式 `true`/`false` 会在凭证下发时投影到 `vertex_model_openapi` 属性；未设置或 `null` 时保留 CPA 的自动路由。凭证级规则优先于 OAuth 别名规则，别名规则不影响 API Key 凭证。删除设置后，下次派发或刷新即不再携带该投影，无需重写数据库凭证。凭证执行选项格式损坏时，合成、派发或刷新会明确失败，不会静默丢弃。
+
+`server.github-token` 是下发给可信 CPA 节点的秘密，不是 Home 管理密钥。凭证身份、秘密和调度信息仍保存在 Auth 记录中；凭证的原始私有配置仅保留供导出，不随凭证下发给 CPA。
+
 #### Credential concurrency lifecycle 字段
 
 两个配置响应都包含 `credentials.concurrency` 对象。`lifecycle-config-revision` 和 `observation-barrier-revision` 由 Home 管理：替换整个配置或该子树时，客户端必须保留这两个字段的当前值；Home 从单例记录派生它们。observation barrier 初始为 `0`，在 policy 变更时单调递增，Home 始终下发当前值。不能通过 YAML import 或 Management API 修改这两个 revision。
@@ -411,6 +446,8 @@ Home 在数据库和下发配置中保留兼容的
 | `cleanup-interval` | `5s` | lifecycle cleanup interval。 |
 
 所有 duration 必须为正数。Home 还要求 `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`，duration 求和溢出也会被视为无效。存在状态为 `active` 或 `canceling` 的 CPA membership 时，仅对 `cpa-heartbeat-timeout`、`cpa-cancel-bound`、`reclaim-grace` 或 `cleanup-interval` 的变更返回 `lifecycle configuration is in use`；完全相同的配置会按未变更接受，非安全时序调优字段仍可更新。
+
+订阅仅在 Home 成功持久化存活状态后续期心跳期限。临时数据库超时会跳过 PONG，不立即隔离订阅；但如果在该 membership 的 `cpa-heartbeat-timeout` 内始终未能成功持久化，Home 会独立计时并隔离该精确 lifetime。期限由 lifetime 持有：订阅断线或退订不能取消期限，且期限在客户端数量同步或初始消息发送之前注册。即使数据库不可用，到期也会取消关联命令连接和本地任务。配置/集群消息和 RTT 回显均不能延长期限；明确的 membership 失效或 Home fencing 仍立即触发隔离。此 Home 侧保护兼容现有 CPA 客户端；更新后的 CPA 客户端同样仅允许有效心跳 PONG 续期接收期限。
 
 ## 节点、版本和证书
 
@@ -1050,6 +1087,7 @@ Path 参数：
 | `password` | string | 否 | 非空明文会以 bcrypt hash 存储。已有合法 bcrypt hash 会原样保留，便于迁移。响应不返回密码材料，只返回 `password_set`。 |
 | `credits` | number | 否 | 用户点数余额；默认为 `0`。当客户端 API key 绑定到该用户且 credits `<= 0` 时，RESP `RPOP auth` 返回 `user_credits_insufficient`。对于计费工作流，优先使用 `/billing/balance-records/recharge` 和 `/billing/balance-records/deduct`，以便余额变更拥有分类账记录。 |
 | `credits_unlimited` | boolean | 否 | 为 `true` 时，派发忽略总 `credits` 余额，计费扣费也不减少余额；周期限额仍生效。默认 `false`。 |
+| `billing_multiplier` | number 或 null | 否 | 作用于该用户所有 API key 扣费的非负倍率（如 `0.8` 表示八折，`0` 表示免费）。`null` 表示清除，即按 `1` 计。非法值返回 `400`，code 为 `invalid_limit`。用户响应包含该值。 |
 | `timezone` | string | 否 | 自然日/周/月使用的 IANA 时区；默认 `Asia/Shanghai`。 |
 | `limit_5h_credits` | number/null | 否 | 5 小时 credits 限额。`null` 清除/关闭。`0` 立即不可用。 |
 | `window_mode_5h` | string | 否 | `first_use`（默认；别名 `fixed`）或 `sliding`。 |
@@ -1550,6 +1588,8 @@ Query 参数：
 | `user_id` | integer | 可选精确用户 ID 过滤；别名：`uid`。 |
 | `provider` | string | 可选 provider 过滤。 |
 | `model` | string | 可选 model 过滤。 |
+| `cost_diagnostic` | string | 可选零费用诊断过滤：`unpriced_model`、`zero_price`，或 `any` 表示所有被标记的 charge。 |
+| `auth_index` | string | 可选的服务凭证精确过滤。 |
 | `limit` | integer | 可选分页大小；默认 `50`，最大 `200`。 |
 | `offset` | integer | 可选分页偏移；负数会规范化为 `0`。 |
 
@@ -1577,7 +1617,7 @@ Query 参数：
       "request_id": "req_xxx",
       "endpoint": "/v1/chat/completions",
       "matched_price_rule": "openai:gpt-5.5:priority:272001",
-      "price_snapshot": { "request_price": 0, "input_price_per_million": 2.5, "matched_service_tier": "priority", "min_input_tokens": 272001, "requested_service_tier": "priority", "response_service_tier": "default", "service_tier_source": "request", "effective_service_tier": "priority", "response_tier_fallback": false },
+      "price_snapshot": { "request_price": 0, "input_price_per_million": 2.5, "matched_service_tier": "priority", "min_input_tokens": 272001, "context_input_tokens": 300000, "price_model_source": "model", "requested_service_tier": "priority", "response_service_tier": "default", "service_tier_source": "request", "effective_service_tier": "priority", "response_tier_fallback": false },
       "cache_read_tokens": 0,
       "cache_write_tokens": 0
     }
@@ -1671,7 +1711,7 @@ Query 参数：
 
 列出模型价格规则。
 
-响应始终包含 `price_rule_schema_version: 2`，即使 `items` 为空。规则先匹配规范化后的精确 service tier，再回退到兼容通配符 `*`，然后选择不大于 usage 原始 input-token 数量的最大 `min_input_tokens`。
+响应始终包含 `price_rule_schema_version: 2`，即使 `items` 为空。规则先匹配规范化后的精确 service tier，再回退到兼容通配符 `*`，然后选择不大于 usage 完整提示上下文（未缓存 input + cache-read + cache-write token）的最大 `min_input_tokens`。规则的 `provider` 可以为 `*` 以匹配所有 provider，`model` 可以以单个 `*` 结尾进行不区分大小写的前缀匹配（如 `gemini-3.5-*`，或 `*` 匹配所有模型）；`*` 出现在其他位置会返回 `400 invalid_body`。模型比较不区分大小写。查价按特异性从高到低逐级尝试实际执行的 `model` 和客户端请求的 `alias`：精确 provider + 精确模型、精确 provider + 最长匹配模式、`*` provider + 精确模型、`*` provider + 最长匹配模式。因此精确 alias 优先于模型通配。全部未命中时扣费使用 `default:zero`。`price_snapshot.price_match` 记录命中级别（`exact`、`model_pattern`、`any_provider`、`any_provider_model_pattern`）。未配价 dispatch 拦截同样接受精确与通配规则。
 
 查询参数：
 
@@ -1695,12 +1735,54 @@ Query 参数：
 | `cache_read_price_per_million` | number | Cache-read token 价格。 |
 | `cache_write_price_per_million` | number | Cache-write token 价格。 |
 | `request_price` | number | 每请求价格。 |
+| `cache_write_30m_price_per_million` | number 或 null | 30 分钟缓存写入单价；`null` 回退到 cache-write 单价（其为 0 时回退到 input 单价）。 |
+| `cache_write_1h_price_per_million` | number 或 null | 1 小时缓存写入单价；`null` 回退到 30 分钟缓存写入单价。 |
+| `cache_write_12h_price_per_million` | number 或 null | 12 小时缓存写入单价；`null` 回退到 1 小时缓存写入单价。 |
+| `reasoning_price_per_million` | number 或 null | 思考输出 token 单价；`null` 按 output 单价计费。 |
+| `image_input_price_per_million` | number 或 null | 图片输入 token 单价；`null` 回退到 input 单价。 |
+| `image_output_price_per_million` | number 或 null | 图片输出 token 单价；`null` 回退到 output 单价。 |
+| `audio_input_price_per_million` | number 或 null | 音频输入 token 单价；`null` 回退到 input 单价。 |
+| `audio_output_price_per_million` | number 或 null | 音频输出 token 单价；`null` 回退到 output 单价。 |
+| `web_search_price_per_call` | number 或 null | 每次联网搜索的美元价格；`null` 表示不收费。 |
+| `image_price_per_image` | number 或 null | 每张生成图片的美元价格；`null` 表示不收费。 |
+| `reasoning_effort_multipliers` | object 或 null | 规范化 reasoning effort 到 token 费用倍率的映射；usage 的 `reasoning_effort` 不在映射中时不乘倍率。 |
 | `source` | string | 价格来源。 |
 | `enabled` | boolean | 规则是否启用。 |
 | `note` | string | 操作备注。 |
 | `created_at` | string | 创建时间。 |
 | `updated_at` | string | 最近更新时间。 |
 | `revision` | integer | 用于导入并发冲突检测的单调递增规则版本。 |
+
+可选维度单价作用于从 v2 规范桶中拆出的子桶，因此总 token 数不变：`cache_write_30m`/`cache_write_1h`/`cache_write_12h` 来自 cache-write 桶，`image_input`/`audio_input` 来自未缓存输入，`reasoning` 来自输出，`image_output`/`audio_output` 来自非思考输出。Home 从 usage 的 `tokens` 对象或顶层结构化字段读取可选计数 `cache_creation_30m_tokens`（别名 `cache_write_30m_tokens` 或 `cache_details.ephemeral_30m_input_tokens`）、`cache_creation_1h_tokens`（别名 `cache_write_1h_tokens` 或 `cache_details.ephemeral_1h_input_tokens`）、`cache_creation_12h_tokens`（别名 `cache_write_12h_tokens` 或 `cache_details.ephemeral_12h_input_tokens`）、`image_input_tokens`、`image_output_tokens`、`audio_input_tokens`、`audio_output_tokens`，并将每项截断到其父桶；当未显式上报分档计数且 `cache_details.ttl` 为 `30m`、`1h` 或 `12h` 时，缓存写入会归入对应 TTL 档位。CPA 未上报某计数时该子桶为空，按父桶单价计费。显式 `0` 表示该子桶免费；`null` 不会导致少收。
+
+按次附加费使用 `web_search_requests`（回退 `tool_usage_details.web_search_calls`）与 `image_count`（回退 `tool_usage_details.image_generation_calls`）计数，读取自 usage 的 `tokens` 对象或 payload 顶层，在 `cost_breakdown` 中以 `count * 单价` 记为 `web_search_calls`、`images` 项，与 `request_price` 一样直接累加，不乘 `reasoning_effort_multipliers`。未配置单价时不收费。
+
+#### 价格表达式
+
+`pricing_expr`（string，可选）设置后会替代该规则的全部价格列，包括 `request_price` 和可选维度单价；空字符串表示清除。规则匹配（provider、model、service tier、`min_input_tokens`）不变；`reasoning_effort_multipliers` 和用户 `billing_multiplier` 仍作用于计算结果。
+
+表达式的结果单位为“美元/百万 token”：每个 token 变量乘以 `$/1M` 系数，例如 `p * 3 + c * 15` 表示未缓存输入 $3/M、输出 $15/M。`usd(x)` 表示固定美元金额，例如 `req * usd(0.01)` 为每请求收费。
+
+| 名称 | 含义 |
+| --- | --- |
+| `p` | 未缓存文本输入 token。 |
+| `c` | 非思考文本输出 token。 |
+| `r` | 思考输出 token。 |
+| `cr` | 缓存读取 token。 |
+| `cc`、`cc30m`、`cc1h`、`cc12h` | 5 分钟、30 分钟、1 小时、12 小时缓存写入 token。 |
+| `img`、`imgo`（`img_o`）、`ai`、`ao`、`vi`、`vo`、`fi` | 图片输入、图片输出、音频输入、音频输出、视频输入、视频输出、文件/文档输入 token。 |
+| `img_cr`、`acr`（`ai_cr`）、`ct`、`apred`、`rpred` | 图片缓存读取、音频缓存读取、文本缓存读取、采纳预测、拒绝预测 token。 |
+| `len`、`total` | 完整提示上下文（未缓存 + 缓存读 + 缓存写）及总 token（输入 + 输出），用于条件判断。 |
+| `req` | 成功请求为 `1`，失败请求为 `0`。 |
+| `ws`、`wsq`、`wf`、`xs`、`ce`（`ci`）、`fs`、`ds`、`mcp`、`maps`、`src`、`st` | `tool_usage_details` 服务端工具计数：联网搜索调用/查询、网页抓取、X 搜索、代码执行、文件/集合搜索、文档搜索、MCP 调用、Google Maps 接地块数、引用源数、服务端工具总调用数。表达式未引用 `ws` 时，仍按规则 `web_search_price_per_call` 收费。 |
+| `imgn`（`image_count`）、`pmedia`、`cmedia`、`paudio`、`asec`、`upcost` | 生成图片张数、提示/输出媒体数、提示音频数（`media_counts`）、音视频秒数（`media_counts.audio_seconds`）、上游上报美元成本（`cost_details`）。表达式未引用 `imgn`/`image_count` 时，仍按规则 `image_price_per_image` 收费。 |
+| `tier`、`upstream_tier`、`speed`、`geo`、`cache_ttl`、`img_size`、`img_res`、`img_quality`、`img_ratio`、`img_tier`、`byok`、`response_model`、`effort`、`model`、`provider`、`endpoint` | 生效 service tier、上游返回 service tier、推理速度、推理地域、缓存 TTL/retention、图片尺寸/分辨率/质量/宽高比/归一化尺寸档位（`1k`/`2k`/`4k`）、BYOK 标记、上游实际响应模型、reasoning effort、实际模型、provider、endpoint 字符串；字符串 `==`/`!=` 不区分大小写。 |
+| `hour(tz)`、`minute(tz)`、`weekday(tz)`、`month(tz)`、`day(tz)` | usage 时间在 IANA 时区字面量下的值（默认 `UTC`）；`weekday` 中周日为 `0`。 |
+| `tier(name, expr)`、`fixed(x)`、`usd(x)`、`u(path)`、`s(path)`（`param(path)`）、`min(...)`、`max(...)`、`abs(x)`、`ceil(x)`、`floor(x)`、`round(x)`、`contains(s, sub)`（`has(s, sub)`） | 辅助函数。`tier(name, expr)` 会在 `cost_breakdown` 中记录 `matched_tier`；`fixed(x)` 按 `req * usd(x)` 计费；`u(path)` 与 `s(path)` 动态读取 usage JSON 数值与字符串字段；兼容可选 `v1:` 前缀。 |
+
+支持 `+ - * /`、比较运算、`&& || !` 以及 `cond ? a : b`。示例：`len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`；峰谷示例：`(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`。
+
+文本缓存 `ct` 从缓存读取桶拆出，并限制在扣除图片/音频缓存读取后的剩余 token 数内，避免重复计费。表达式未引用的 token 桶会在求值前并入父桶，保证不漏计：`ct` 并入 `cr`，`cc12h` 并入 `cc1h`（或 `cc`），`cc1h` 并入 `cc`，`cc`、`cr`、`img`、`ai` 并入 `p`，`imgo`、`ao`、`r` 并入 `c`。如需某桶免费，需显式引用，例如 `cr * 0`。保存时会校验语法、变量与函数名、时区字面量，并用样例数据求值，结果必须为有限非负数，否则返回 `400 invalid_body`。扣费时若求值失败（如除零），Home 改用规则价格列计费并标记 `cost_diagnostic: pricing_expr_error`，错误写入 `cost_breakdown.expression_error`。成功的扣费会记录 `price_snapshot.pricing_expr`、`cost_breakdown.pricing_expr`、并桶后的 token 数（`expr:<name>` 项）以及结果（`expression` 项）。用户价格阶梯在使用表达式的档位上返回 `pricing_expr`。
 
 ### POST `/billing/model-prices`
 
@@ -1719,6 +1801,18 @@ Query 参数：
 | `cache_read_price_per_million` | number | 否 | 非负 cache-read token 价格。 |
 | `cache_write_price_per_million` | number | 否 | 非负 cache-write token 价格。 |
 | `request_price` | number | 否 | 非负每请求价格。 |
+| `cache_write_30m_price_per_million` | number 或 null | 否 | 可选非负 30 分钟缓存写入单价；`PATCH` 时 `null` 表示清除。 |
+| `cache_write_1h_price_per_million` | number 或 null | 否 | 可选非负 1 小时缓存写入单价；`PATCH` 时 `null` 表示清除。 |
+| `cache_write_12h_price_per_million` | number 或 null | 否 | 可选非负 12 小时缓存写入单价；`PATCH` 时 `null` 表示清除。 |
+| `reasoning_price_per_million` | number 或 null | 否 | 可选非负思考输出单价；`PATCH` 时 `null` 表示清除。 |
+| `image_input_price_per_million` | number 或 null | 否 | 可选非负图片输入单价；`PATCH` 时 `null` 表示清除。 |
+| `image_output_price_per_million` | number 或 null | 否 | 可选非负图片输出单价；`PATCH` 时 `null` 表示清除。 |
+| `audio_input_price_per_million` | number 或 null | 否 | 可选非负音频输入单价；`PATCH` 时 `null` 表示清除。 |
+| `audio_output_price_per_million` | number 或 null | 否 | 可选非负音频输出单价；`PATCH` 时 `null` 表示清除。 |
+| `web_search_price_per_call` | number 或 null | 否 | 可选非负每次联网搜索美元价格；`PATCH` 时 `null` 表示清除。 |
+| `image_price_per_image` | number 或 null | 否 | 可选非负每张图片美元价格；`PATCH` 时 `null` 表示清除。 |
+| `reasoning_effort_multipliers` | object | 否 | 可选的 reasoning effort（不区分大小写，如 `xhigh`）到非负 token 费用倍率的映射，不作用于每请求价格；`PATCH` 时 `{}` 表示清除。 |
+| `pricing_expr` | string | 否 | 可选价格表达式，替代价格列，详见“价格表达式”；`PATCH` 时 `""` 表示清除。 |
 | `source` | string | 否 | 价格来源，例如 `manual`。 |
 | `enabled` | boolean | 否 | 规则是否启用；默认 `true`。 |
 | `note` | string | 否 | 操作备注。 |
@@ -1753,27 +1847,31 @@ Query 参数：
 
 ### GET `/billing/settings`
 
-返回 DB-backed 计费策略。`service_tier_source` 默认为 `request`，允许值为 `request` 或 `response`。`report_timezone` 必须是受支持的 IANA 时区，默认值为 `UTC`；当 Management Billing 请求未提供 `timezone` 覆盖时，它作为报表默认日历时区。修改该设置只影响后续报表的边界和分组，不会重新计算历史 charge、重写价格快照或改变余额。无论哪种 tier-source 模式，`auto`、`default` 和 `standard` 都按本地 Standard 价格 tier 匹配。
+返回 DB-backed 计费策略。`model_source` 默认为 `request`，允许值为 `request` 或 `response`（`request` 优先按请求侧模型 ID 匹配价格，未命中时回退到 `response_model`；`response` 优先按上游 `response_model` 匹配价格，未命中时回退到请求侧模型）。`service_tier_source` 默认为 `request`，允许值为 `request` 或 `response`。`report_timezone` 必须是受支持的 IANA 时区，默认值为 `UTC`；当 Management Billing 请求未提供 `timezone` 覆盖时，它作为报表默认日历时区。修改该设置只影响后续报表的边界和分组，不会重新计算历史 charge、重写价格快照或改变余额。无论哪种 tier-source 模式，`auto`、`default` 和 `standard` 都按本地 Standard 价格 tier 匹配。
+
+`allow_unpriced_models` 默认为 `false`。为 `false` 时，用户所属 API key 请求的模型如果在任何 provider 下都没有启用的价格规则，dispatch 会返回 `model_not_found`（`model <id> has no configured price`）。价格全为 0 的规则也算已配置，因此显式免费的模型仍可调用。不属于用户的 API key 不受此限制。设为 `true` 后允许调用未配价模型，其扣费按 $0 记录并标记 `cost_diagnostic: unpriced_model`。管理员扣费响应还包含扣费时固化的字段：`billed_cache_read_tokens`、`billed_cache_write_tokens`、`billed_reasoning_tokens`（v2 完整核算下实际计价的 token 桶，旧版核算为 `null`），以及 `cost_breakdown`（`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`）。扣费金额、余额增减和余额在入库前统一量化到 8 位小数，因此 `cost_breakdown.total` 与 `amount` 一致。管理员扣费响应还包含 `base_amount`（规则倍率后、用户 `billing_multiplier` 前的标价金额）、`billing_multiplier` 和 `auth_index`（服务凭证）。`amount = round(base_amount * billing_multiplier, 8)`。按 `auth_index` 汇总 `base_amount` 可衡量每个凭证的产出价值，不受客户折扣影响；`amount` 为实际收入。`cost_breakdown` 同样记录 `base_total`、`billing_multiplier` 和实际生效的 `reasoning_effort_multiplier`。默认 `request` 来源优先使用 CPA 上报的 `effective_service_tier`（CPA 配置覆盖后实际发往上游的 tier），缺失时才回退到客户端的 `service_tier`，因此被 CPA 升级为 `priority` 的请求按 priority 计费，被降级的请求按较低 tier 计费；快照记录为 `outbound_service_tier`。失败请求仅在上游报告了已消耗 token 时计费（如 prompt 已处理后客户端取消的 `499` 流），此类扣费不含 `request_price` 与按次附加费，并在 `price_snapshot` 中记录 `failed_request: true` 与 `fail_status_code`；无 token 的失败请求不计费。`/images/generations` 或 `/images/edits` 请求在 CPA 未上报 `image_count` 时至少按 1 张图片收取 `image_price_per_image`。管理员扣费响应中的 `cost_diagnostic` 为空表示正常，`unpriced_model` 表示未命中任何价格规则，`zero_price` 表示命中规则但金额为 $0；同一值也写入 `price_snapshot.cost_diagnostic`。
 
 ```json
-{ "service_tier_source": "request", "report_timezone": "UTC" }
+{ "model_source": "request", "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
 ```
 
 ### PATCH `/billing/settings`
 
-局部更新计费设置。两个字段均为可选。在 `response` 模式下，如果 response tier 缺失，会回退到 request tier，并在扣费价格快照中记录该回退。非法 tier-source 值或不支持的时区名称返回 `400 invalid_body`。
+局部更新计费设置。所有字段均为可选。在 `response` 模式下，如果 response tier 缺失，会回退到 request tier，并在扣费价格快照中记录该回退。非法 tier-source 值或不支持的时区名称返回 `400 invalid_body`。
 
 ```json
-{ "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
+{ "model_source": "request", "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
 ```
 
 OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表示，不能作为字面量直接发给 Codex backend。参见 [OpenAI 定价页](https://developers.openai.com/api/docs/pricing) 和 [Responses Create 参考](https://developers.openai.com/api/reference/resources/responses/methods/create)。Home 保存请求 `service_tier` 和可选上游 `response_service_tier`，方便后续切换计费来源而无需重新灌入 usage。默认 `request` 来源按 `service_tier`（客户端请求 tier）计费。在 `response` 模式下优先使用 `response_service_tier`，上游未返回时回退请求 tier。`auto`、`default` 和 `standard` 都映射到本地 Standard 规则；使用 `flex` 或 `priority` 时请配置相应规则。
 
-扣费 `price_snapshot` 审计数据包含 `requested_service_tier`、可选的 `response_service_tier`、`service_tier_source`、`effective_service_tier`、`response_tier_fallback`、`matched_service_tier` 和 `min_input_tokens`。上下文分段使用原始 input-token 总数。在 OpenAI Responses 协议中，`input_tokens` 已包含 cache-read 和 cache-write token。Home 会先从普通 input 中扣除 cache-read token，再应用 cache-read 价格；当 `cache_write_price_per_million` 大于零时，也会先从普通 input 中扣除 cache-write token，再应用独立的 cache-write 价格；价格为零或未提供时，这些 cache-write token 仍按普通 input 计费。在 Anthropic Messages 协议中，`input_tokens`、`cache_read_input_tokens` 和 `cache_creation_input_tokens` 是相互独立的 bucket，因此 Home 会分别计费，不会从 input 中扣除任何 cache bucket。cache 字段兼容回填只更新 usage 计数；已有不可变 `billing_charge` 快照和余额不会自动重算，历史修正需要显式、可审计的余额调整。
+扣费 `price_snapshot` 审计数据包含 `requested_service_tier`、可选的 `response_service_tier`、`service_tier_source`、`effective_service_tier`、`response_tier_fallback`、`matched_service_tier`、`min_input_tokens`、`context_input_tokens` 和 `price_model_source`（`model` 或 `alias`，未命中规则时省略）。上下文分段使用 `context_input_tokens`，即包含 cache-read 和 cache-write 的完整提示上下文，因此缓存命中率高的 Anthropic usage 与等长未缓存请求会命中同一分段。在 OpenAI Responses 协议中，`input_tokens` 已包含 cache-read 和 cache-write token。Home 会先从普通 input 中扣除 cache-read token，再应用 cache-read 价格；当 `cache_write_price_per_million` 大于零时，也会先从普通 input 中扣除 cache-write token，再应用独立的 cache-write 价格；价格为零或未提供时，这些 cache-write token 仍按普通 input 计费。在 Anthropic Messages 协议中，`input_tokens`、`cache_read_input_tokens` 和 `cache_creation_input_tokens` 是相互独立的 bucket，因此 Home 会分别计费，不会从 input 中扣除任何 cache bucket。cache 字段兼容回填只更新 usage 计数；已有不可变 `billing_charge` 快照和余额不会自动重算，历史修正需要显式、可审计的余额调整。
 
 ### POST `/billing/model-prices/import/preview`
 
-创建服务端的不可变 `models.dev` 导入预览。服务端拉取并固定来源快照；客户端提供目标、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考及缓存写入 TTL token 单价。可选 token 单价未设置时使用父桶单价，显式为零时保持免费；即使其他分支配置了同一细分维度，也不会漏计。
+
+创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 自动从已有 usage 与价格规则发现模型）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
 
 当前 preview target 只描述通配符 base 规则（`service_tier: "*"`、`min_input_tokens: 0`）；其他 target scope 会被拒绝，不会被静默改写。已匹配行会包含官方价格、倍率后的最终价格、精确的 `write_rule`、带 `revision` 的完整可选 `existing_rule` 快照，以及机器可读的原因。models.dev 上下文分段会生成不同包含式下界的通配符行；`row_multipliers` 按返回的精确 row key 生效，包含 context-band 行。cache-read 和 cache-write 价格从固定的 catalog snapshot 导入。当 cost 对象包含 input 价格但省略 `cache_read` 或 `cache_write` 时，Home 分别按 `input * 0.1` 或 `input * 1.25` 派生缺失价格；显式值（包括零）保持不变。出现不支持的价格维度、格式错误或无效的价格/分段、重复分段，或 tier 缺少 base 已配置价格维度时，整个 target 都不可应用；服务端不会导入可能低估计费的子集。
 
@@ -1912,6 +2010,8 @@ OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表�
 
 所有路径支持 `GET`、`PUT`、`PATCH` 和 `DELETE`。`GET` 直接返回分组数组。`PUT` 和 `PATCH` 都替换该家族的整个数组，不追加元素，也不按下标修改单个 key。`DELETE` 移除家族并清空其 provider-key 记录；也可提交 `[]` 清空列表。删除单个 key 时，需提交保留其他 key 及其 `id` 的完整家族列表。成功响应为 `{"status":"ok","config-version":8}`。
 
+JSON 读取会为每个 key 附加只读的 `auth_index`，值等于该 key 的凭证 `id`；无 key 的 `openai-compatibility` 分组则附加在分组上。它就是 `/requests/api-call` 接受的 `auth_index` 选择器，与 CPA 的 v8 配置读取一致。`GET /config.yaml` 不包含该字段；写入时会从分组和 key 上移除 `auth_index` 与 `auth-index`，因此读取结果可以原样写回。
+
 ### 原生 Provider 分组
 
 `PUT /config/api-keys/codex` 请求体示例：
@@ -1968,6 +2068,12 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 
 每个 key 可设置整数 `weight`，缺省为 `1`，最大 `1000000`；非正数仅在启用加权调度时排除该凭证。权重属于 key，不能放在分组上。配置 key 列表中的显式 `null`、字符串和小数均不合法。OAuth/文件凭证可在上传的 auth JSON 顶层携带数值 `weight`。
 
+开启 `routing.session-affinity` 后，粘性命中（包括继承父会话绑定）的请求也会消耗权重额度，但不会为了均衡迁移已有绑定；新建或重新选择的会话优先分配给低于目标份额的凭证。不同优先级层、allowlist、重试排除和冷却子集按实际候选凭证集合隔离额度，回到原候选池时继续使用保留额度。粘性请求只与绑定凭证同优先级层的可用凭证记账，固定凭证（pinned）请求在固定凭证所属优先级层内按固定前的合格候选池记账，低优先级绑定不会改变高优先级凭证之间的比例。
+
+结算后的额度限制在候选池总权重的 ±32 倍，因此请求比例是近似目标而非严格保证。粘性请求的完整额度增量无法放入上限时，保留绑定但不预留、不记账；新会话继续赚取额度和偿还欠额，避免超额粘性流量饿死小权重凭证。并发选择能看到未提交的预留；存在未结算预留时，已提交余额可暂时超出上限，抵消额度保留至整个池结算完毕，最后一个预留回滚也会触发裁剪。绑定提交及并发准入成功后确认预留，失败或重试时释放，不消耗已提交额度。
+
+额度保存在各 Home 进程内，进程重启、选择器替换或有界候选池缓存淘汰后重置；权重变化会重置对应池额度并使该池的旧预留失效。数据库共享绑定不变。
+
 ### Provider 专属 Key 选项
 
 | 字段 | Provider | 含义 |
@@ -1975,7 +2081,7 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 | `disable-codex-cloaking` | Codex | 可选布尔值，控制该 API Key 凭证的 Codex 身份请求头。 |
 | `websockets` | Codex、xAI | 启用 Responses WebSocket 传输。 |
 | `alpha-search` | Codex | 允许 `/v1/alpha/search` 通过配置的上游 `/alpha/search` 执行。 |
-| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`cache-user-id` 的对象。 |
+| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`sensitive-words-replace`、`sensitive-patterns-replace`、`cache-user-id` 的对象。 |
 | `experimental-cch-signing` | Claude | 兼容保留；支持的直连上游已自动签名。 |
 | `rebuild-mid-system-message` | Claude | 重建会话正文中间的 system 消息。 |
 | `native-tool-search` | Claude | 信任自定义 base URL 支持 Anthropic 原生 tool search（`defer_loading` + `tool_reference`），用于 Codex `tool_search`；官方 `api.anthropic.com` 凭证自动启用。需要开启 `upstream.claude.tool-search`。 |
@@ -2400,6 +2506,12 @@ Selector 字段：
 
 批量请求即使部分刷新失败也返回 `200`，应检查 `results[].success`。输入错误返回 `400`，单凭证不存在返回 `404`，单凭证刷新失败返回 `500 refresh_failed`，协调器不可用返回 `503`。
 
+Codex 刷新对临时网络错误、响应读取或解析失败、未返回有效 access token 等情况进行有限次数重试。重试耗尽后进入正常刷新退避，后续仍可再次尝试。提供方明确拒绝凭证（`invalid_grant`、refresh token 过期、撤销或已复用）时仍需要恢复凭证；仅未获取到 access token 不再要求更换凭证。
+
+并发 Codex 刷新的等待方会独立响应自身取消或超时，不会取消共享刷新或其他调用者。发起方保留刷新结果，包括已返回的令牌轮换结果。
+
+Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_refresh_outcomes` metadata 和 `codex_refresh_journal` 记录不再阻止刷新。日志表仅为兼容旧数据库和快照（包括 v17 备份）而保留；历史回执可能包含凭证，已有数据库备份仍需妥善保护。
+
 ### GET `/oauth/auth-url`
 
 创建 provider 登录 URL 或设备授权会话。必填查询参数 `provider` 对内置 provider 去除首尾空白且忽略大小写。
@@ -2509,7 +2621,7 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
 | Form field or query | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | form `file` | file | 是 | Vertex service account JSON。 |
-| form/query `location` | string | 否 | Vertex location；默认 `us-central1`。 |
+| form/query `location` | string | 否 | Vertex location；默认 `global`。 |
 
 输出示例：
 
@@ -2519,7 +2631,7 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
   "auth-file": "11111111-2222-4333-8444-555555555555.json",
   "project_id": "project-id",
   "email": "service-account@example.iam.gserviceaccount.com",
-  "location": "us-central1"
+  "location": "global"
 }
 ```
 
@@ -2556,7 +2668,7 @@ Home 会把生成的 credential 作为 DB-backed OAuth auth records 存储，并
 }
 ```
 
-`display_name` 和 `supported_providers` 可省略。仅在 Home 配置了采集触发器时列出内置条目；当前内置 provider key 为 `claude`、`antigravity`、`codex`、`kimi`、`xai`、`meta`。插件是否支持重置由 `supports_reset` 表示。
+`display_name` 和 `supported_providers` 可省略。仅在 Home 配置了采集触发器时列出内置条目；当前内置 provider key 为 `claude`、`antigravity`、`codex`、`devin`、`kimi`、`xai`、`meta`。插件是否支持重置由 `supports_reset` 表示。
 
 ### POST `/credentials/quota/fetch`
 
@@ -2658,9 +2770,11 @@ Home 先调用匹配插件。插件接管请求时，成功以 `200` 直接返�
 | `method` | string | 是 | HTTP method；会转成大写。 |
 | `url` | string | 是 | 带 scheme 和 host 的绝对 URL。 |
 | `header` | object string to string | 否 | 请求头；包含 `$TOKEN$` 的 header value 会替换为选中 auth token。`Host` 会设置 request host override。 |
-| `data` | string | 否 | 原始请求体字符串。 |
+| `data` | string | 否 | 原始请求体字符串。`$TOKEN$` 会替换为所选凭证的 token，并安全转义 JSON 字符串值。 |
 
-Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就必须解析到 DB auth 或 runtime auth，否则返回：
+替换 `$TOKEN$` 的请求仅跟随同源重定向（相同 scheme、host 与有效端口）；不安全重定向返回 HTTP `502`，不会继续转发凭证。
+
+Token 替换更严格：只要任意 header 或请求体包含 `$TOKEN$`，`auth_index` 就必须解析到 DB auth 或 runtime auth，否则返回：
 
 ```json
 { "error": "auth not found" }
@@ -2840,15 +2954,26 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credentials.in
 
 ### 额度快照通用约定
 
+Devin 使用 Connect-RPC JSON 调用 `https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，将数据库中的 `api_key` 或 `session_token` 放入 `metadata.apiKey`。从 `userStatus.planStatus` 生成稳定的 `devin-daily` 和 `devin-weekly` 账号窗口，分别记录日／周剩余比例、周期以及 Unix 秒重置时间。`planInfo.planName` 和 `planEnd` 提供套餐名称与可选订阅到期时间。可选套餐字段异常不影响有效额度；套餐缺失或格式异常时保留上次套餐，零值或非法到期时间不输出。接受数值字符串；缺失或非法余量保持未知，不补成零。只持久化包含有效剩余额度数值的周期；部分响应标记 `partial`，与仍有效的旧周期合并，未观测周期保留原数值、采集时间与有效期。完全没有有效剩余额度数值（包括仅有重置时间）的响应按采集失败处理并保留旧快照。已提供的重置时间过期时忽略该周期。各窗口分别使用其采集有效期与自身重置时间中的较早者，即使重置时刻恰好发生在解析与持久化之间；某个周期重置不会使其他周期提前失效。快照与定时重采集采用有效窗口中最早的有效期；部分合并时也包含保留的旧窗口，并遵守上游要求的最早重试时间。采集不触发凭证刷新。额度探测收到 HTTP `426` 时记录 `UPSTREAM_CLIENT_OUTDATED`，与授权失败分开表示。
+
 额度快照接口是纯只读 DB 视图。读取不会请求上游 Provider、刷新 OAuth token、改变调度优先级或消费队列。凭证存在但从未产生快照且从未尝试采集时返回 `quota_status=unknown`、`freshness=never`、空窗口和 HTTP `200`。如果第一次采集在获得任何可用额度事实前失败，则返回 `quota_status=error`、`freshness=never` 和 `collection_status=failed`。Provider 明确不在当前采集规划内时返回 `unsupported`。凭证删除后不再可见，对应额度表记录同时删除；凭证 Provider 或凭证类型发生变化时，也会清除旧身份的额度快照。
 
 所有时间为 RFC3339 UTC 或 `null`；比例为 `[0,1]`；数量字段允许 `null`；无限额度使用 `is_unlimited=true`。不同 Provider 周期始终保留为独立窗口。快照仍为 fresh 时，单独到期的合并窗口会从当前结果中移除且不再参与状态/source 汇总；快照整体变为 stale 后，详情仍保留最后已知窗口用于诊断。`earliest_reset_at` 是该凭证项所代表的完整内部窗口集合中，全部非空 `reset_at` 的最小值；stale 的最后已知数据可能返回过去时间。
 
 当前被动采集从 CPA usage 事件的 `response_headers` 中提取受限 `quota_headers`。Home 只保留 Codex `X-Codex-*` 额度 Header allowlist，以及通过语法校验且不具有 secret 特征的 upstream request ID，并在 usage payload 入库前删除 raw `response_headers`。核心事务开始前，会并发地按 active auth UUID、runtime index、ID 依次解析上报的 `auth_index`，并把稳定 UUID、规范化 Provider/凭证类型身份与额度身份代次写入 usage 行；并发删除或身份变更会通过代次隔离该行与替换后的凭证，不会串行化 usage 入库。核心 usage/billing 事务提交后，Codex Header 观测才在隔离的额度事务中归一化并 upsert；非法额度元数据或额度持久化失败都不能回滚核心 usage 或 billing 写入。比 Home 接收时间超前五分钟以上的时间戳会归一化为接收时间。迟到事件不能覆盖更新快照，首次并发写入也遵守该规则。Codex Header 观测始终视为稀疏滚动更新：按稳定 limit 身份和周期合并，保留仍有效的旧窗口以及权威主动探测得到的元数据，不清除正在执行的 probe lease，不延后下一次主动探测，也不绕过失败重试退避。无前缀 Primary/Secondary 窗口仅在 `X-Codex-Active-Limit` 提供合法 limit 身份时摄取：`codex` 与 `premium` 映射到默认 account family，`codex_bengalfox` 映射到 Spark model family，其他合法身份保持为彼此隔离的 model family。active-limit 缺失或非法时只忽略无前缀窗口，明确分组的窗口仍可使用。同一 active family 也出现在明确分组中时，身份与周期相同的窗口合并为一项：额度值以无前缀观测为准，label 可由明确分组补充。同一 limit 周期重复出现的 Primary/Secondary 观测也会合并为一个窗口；已过期窗口不会参与新快照状态汇总。
 
-Home 同时为 Claude、Antigravity、Codex、Kimi、xAI、Meta 的 OAuth/file credential 运行固定目标主动 collector。Codex 读取官方 usage endpoint，使用 `metered_feature` 作为 additional limit 的稳定身份，并推导规范化套餐元数据。无论 usage 汇总是否包含 `rate_limit_reset_credits`，collector 都会独立查询 reset-credit 详情 endpoint。详情请求失败且 usage 汇总报告了正数当前次数时，collection 返回 `partial`，保存本次最新次数和空详情列表，不再沿用旧数量或已过期 credit；两个 endpoint 都没有提供可靠 reset-credit 信息时，会清除旧 reset-credit 数据，但不影响仍然可用的额度窗口。Codex `primary_windows` 会分别保留默认 account family 与 `codex_bengalfox` family 的一个代表窗口，并在每个 family 内优先最长周期（通常为 weekly），因此默认 5 小时窗口或 code-review limit 不会挤掉 Spark。使用位置型 `*-primary`/`*-secondary` ID 的 Codex v1 旧快照会在下一次满足活动门控的定时扫描中触发立即 v2 主动重采集，即使 freshness 或 `next_probe_at` 原本会推迟采集；升级尝试会在发起请求前记录，失败后恢复正常 retry backoff，不会持续绕过退避。旧 raw windows 仍保留用于诊断，但成功升级前 API 表现为 `unknown`/`stale`，升级失败后表现为 `error`/`stale`；v2 成功后原子替换旧 ID，后续被动 Header 观测也不能降低快照版本。Management API 不提供消费 reset credit 的操作。Claude 查询 usage 和 profile，额度成功但 profile 元数据失败时返回 `partial`。Antigravity 携带 credential `project_id` 请求分组额度汇总 endpoint，只将 `gemini-5h`、`gemini-weekly`、`3p-5h` 和 `3p-weekly` 映射到稳定的 `gemini` 与 `third-party` model scope。数字、数字字符串和百分数字符串形式的比例都可解析；disabled、未知或畸形 bucket 会被逐项忽略。只有两个 weekly bucket 都有效时，响应才可以替换最后已知快照；两个 5 小时 bucket 分别可选，不要求成对出现。`primary_windows` 每个稳定 scope 保留一个窗口，并在存在时优先该 scope 的 5 小时窗口。使用旧模型 ID 的 Antigravity v1 快照会在下一次满足活动门控的定时扫描中触发立即 v2 重采集；升级期间 API 返回 `unknown`/`stale`，失败后返回 `error`/`stale` 并遵循正常 retry backoff，成功后原子替换旧模型窗口。Kimi 查询 coding usage，保留账号 usage 汇总和每个 limit 窗口，并兼容数字或字符串形式的数值字段。Kimi 的 Provider limit 优先进入 `primary_windows`，避免聚合 summary 挤掉周限额或 duration 限额。xAI 使用 Grok CLI token-auth、client-version、user-agent 及可选 user-ID Header 请求 billing endpoint，并额外请求同一 endpoint 的 `format=credits` 变体以获取共享周限额；支持 camelCase/snake_case 字段，以及 `{ "val": ... }`、数字或字符串 cents。`monthlyLimit=15000` 推导为 SuperGrok，`monthlyLimit=150000` 推导为 SuperGrok Heavy；`xai-monthly-spend` 月度 USD 窗口仅在月度上限为正数时输出，上限为 0 或缺失时不携带额度信息、直接跳过，因此仅有周限额积分的账号不会被误报为额度耗尽。响应中存在 `creditUsagePercent` 时生成 `xai-weekly-usage` 百分比窗口（0–100 刻度），并以当前周期的结束时间作为重置时间；周限额探测失败时，只要月度响应仍产生可用窗口就不影响整体采集；两个响应都没有产出窗口时，优先上报真实的请求错误而非笼统的响应无效错误。反之，月度请求失败但周限额窗口可用时，采集标记为 `partial` 并保留已存储的套餐信息而不清除，因为周限额响应无法重新推导订阅档位。正数 `onDemandCap` 配合显式或推导出的 `onDemandUsed` 生成 `xai-on-demand` 月度 USD 窗口，cap 缺失或为 0 表示未启用按量付费，不输出该窗口。无法使用这些 OAuth collector 的 Provider API-key credential 返回 `unsupported`。
+Home 同时为 Claude、Antigravity、Codex、Devin、Kimi、xAI、Meta 的 OAuth/file credential 运行固定目标主动 collector。Codex 读取官方 usage endpoint，使用 `metered_feature` 作为 additional limit 的稳定身份，并推导规范化套餐元数据。无论 usage 汇总是否包含 `rate_limit_reset_credits`，collector 都会独立查询 reset-credit 详情 endpoint。详情请求失败且 usage 汇总报告了正数当前次数时，collection 返回 `partial`，保存本次最新次数和空详情列表，不再沿用旧数量或已过期 credit；两个 endpoint 都没有提供可靠 reset-credit 信息时，会清除旧 reset-credit 数据，但不影响仍然可用的额度窗口。Codex `primary_windows` 会分别保留默认 account family 与 `codex_bengalfox` family 的一个代表窗口，并在每个 family 内优先最长周期（通常为 weekly），因此默认 5 小时窗口或 code-review limit 不会挤掉 Spark。使用位置型 `*-primary`/`*-secondary` ID 的 Codex v1 旧快照会在下一次满足活动门控的定时扫描中触发立即 v2 主动重采集，即使 freshness 或 `next_probe_at` 原本会推迟采集；升级尝试会在发起请求前记录，失败后恢复正常 retry backoff，不会持续绕过退避。旧 raw windows 仍保留用于诊断，但成功升级前 API 表现为 `unknown`/`stale`，升级失败后表现为 `error`/`stale`；v2 成功后原子替换旧 ID，后续被动 Header 观测也不能降低快照版本。Management API 不提供消费 reset credit 的操作。Claude 查询 usage 和 profile，额度成功但 profile 元数据失败时返回 `partial`。Antigravity 携带 credential `project_id` 请求分组额度汇总 endpoint，只将 `gemini-5h`、`gemini-weekly`、`3p-5h` 和 `3p-weekly` 映射到稳定的 `gemini` 与 `third-party` model scope，并请求 `loadCodeAssist`（`{"metadata":{"ideType":"ANTIGRAVITY"}}`）推导订阅套餐元数据（优先读取 `paidTier`，其次回退 `currentTier`，将 `g1-ultra-tier`、`g1-ultra-lite-tier`、`g1-pro-tier`、`free-tier` 分别映射为 `Ultra`、`Ultra Lite`、`Pro`、`Free`；订阅读取失败或畸形时标记为 `partial` 并保留最后已知套餐）。数字、数字字符串和百分数字符串形式的比例都可解析；disabled、未知或畸形 bucket 会被逐项忽略。只有两个 weekly bucket 都有效时，响应才可以替换最后已知快照；两个 5 小时 bucket 分别可选，不要求成对出现。`primary_windows` 每个稳定 scope 保留一个窗口，并在存在时优先该 scope 的 5 小时窗口。使用旧模型 ID 的 Antigravity v1 快照会在下一次满足活动门控的定时扫描中触发立即主动重采集；升级期间 API 返回 `unknown`/`stale`，失败后返回 `error`/`stale` 并遵循正常 retry backoff，成功后原子替换旧模型窗口。Kimi 查询 coding usage，保留账号 usage 汇总和每个 limit 窗口，并兼容数字或字符串形式的数值字段。Kimi 的 Provider limit 优先进入 `primary_windows`，避免聚合 summary 挤掉周限额或 duration 限额。无法使用这些 OAuth collector 的 Provider API-key credential 返回 `unsupported`。
 
-collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新解析最新 DB 凭证，并直接使用其中当前保存的 access token，不会调用 OAuth 刷新；凭证刷新仍由独立的 runtime 刷新子系统负责。全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及因 OAuth 刷新失败而被阻断调度的凭证不会被主动探测；模型执行 cooldown 不会阻止额度采集，额度采集自身的重试退避（`next_probe_at`）会推迟定时扫描但不会阻断人工强制重采集。冷却过期或刷新阻断解除后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
+xAI 在单次探测超时内并行查询三个固定 Grok CLI endpoint：billing、其 `format=credits` 变体以及 `/v1/user?include=subscription`。所有请求携带 CLI token-auth、Grok CLI `1.0.70` client-version、一致的 pager/shell User-Agent 和可选 user-ID Header。支持 camelCase/snake_case 账单字段，以及 `{ "val": ... }`、数字或字符串 cents。
+
+- 套餐资格与账单数值分别判断。订阅档位明确为 null、空字符串、`Free` 或 `None` 时记录为 `Free`，忽略所有周额度及产品用量窗口，即使 credits 响应包含周期或百分比。已确认免费且月度响应有效但没有额度时，采集成功，清除旧付费额度，返回空窗口与 `quota_status=unknown`。
+- 已识别付费档位包括 `SuperGrok`、`SuperGrokPlus`、`SuperGrokPro`、`SuperGrokHeavy`、`XPremiumPlus`；兼容大小写、分隔符和 `SUBSCRIPTION_TIER_` 前缀。profile 套餐优先于月度上限推导（15000 cents -> SuperGrok，150000 cents -> SuperGrok Heavy）。订阅字段缺失、畸形、查询失败或未知档位都不能确认付费资格；未知字符串保留为套餐名称。profile 无法提供套餐时，月度上限推导仅在主动采集的快照锁内补充缺失套餐，不能覆盖已有套餐名称、高级套餐标识或订阅到期时间；后续明确的 profile 结果可以更新这些历史元数据。
+- 有效的显式 `creditUsagePercent`（0–100）生成 `xai-weekly-usage`，以当前周期结束时间作为重置时间。无论数值显式返回还是按省略字段推导，已提供的周周期元数据必须有效且相互一致；结束时间过期或非法、开始时间在未来、周期类型错误或别名冲突时，忽略整个周额度及产品用量观测。显式有效数值缺少重置元数据时，重置时间保持未知。每个月度、周额度及产品窗口的有效期均不超过自身已观测重置时间，即使采集完成时已经跨过该时刻；采集有效期从窗口自身的观测时间起算。快照有效期取各窗口有效期的最早值。仅当本次 profile 确认已识别付费档位、响应明确为周周期且结束时间在未来、可选开始时间有效且不在未来、产品用量不与零值矛盾时，省略的百分比才按零用量处理。显式 null、非法或越界数值、冲突的别名字段、非法周期均不能推导出剩余 100%。产品数值缺失或非法时保持未知，不补成零；产品百分比表示同一额度的用量明细，不是独立配额；它们仍可在详情中展示，但不会独立决定凭证的额度汇总状态，部分采集后保留的历史产品用量也不参与该判定。
+- `monthlyLimit` 为正数时才生成月度 USD 窗口 `xai-monthly-spend`；零值或缺失不表示耗尽。正数 `onDemandCap` 生成 `xai-on-demand`，优先使用显式或推导出的用量，无法确定时保持未知；cap 缺失或为零时不输出该窗口。
+- 任一组件查询失败或数据不完整时，保留其他可用数值并返回 `partial`。至少一个组件提供有效数值时，月度／按量付费与周额度／产品明细两组分别替换：失败组保留仍有效的旧窗口、原数值、采集时间及有效期，未知新数值不能覆盖仍有效的旧数值。成功组可以清除已关闭的上限或已移除的条目；已确认免费时清除周额度及产品明细。已过期保留窗口会被清理，后续完整响应正常替换旧值。完全没有有效用量数值的失败或不完整采集保留旧快照、套餐及采集时间，并遵循正常重试退避。客户端需升级、授权失败及限流错误优先于笼统的解析错误。部分成功和整次失败均遵守所有失败组件中最长的 `Retry-After`，不受展示哪条错误影响；它只延后定时采集，不延长额度有效期。后续采集成功时清除错误及失败计数。已确认免费且额度为空的成功快照按上述规则替换旧值。
+- 低于 v3 的 xAI 快照在下一次满足活动门控的定时扫描中触发重采集，即使旧快照仍在有效期内。升级尝试在请求前记录，失败后遵循正常退避；成功时原子替换旧额度。
+
+collector 直接读取 DB 凭证，不接受 HMC 提交 URL。携带凭证的额度请求仅跟随原 scheme、host 及有效端口相同的重定向；跨源重定向及 HTTPS 降级会在转发请求前被拒绝。探测前会重新解析最新 DB 凭证，并直接使用其中当前保存的 access token，不会调用 OAuth 刷新；凭证刷新仍由独立的 runtime 刷新子系统负责。全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及因 OAuth 刷新失败而被阻断调度的凭证不会被主动探测；模型执行 cooldown 不会阻止额度采集，额度采集自身的重试退避（`next_probe_at`）会推迟定时扫描但不会阻断人工强制重采集。冷却过期或刷新阻断解除后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
 
 凭证核心字段：
 
@@ -2873,7 +2998,7 @@ collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新
 | `window_count` | integer | 全部当前窗口数。 |
 | `error` | object/null | 已脱敏采集错误，message 最多 500 bytes。 |
 | `runtime` | object/null | Home 和 CPA 归属元数据。 |
-| `plan` | object/null | collector 推导的 Provider 订阅套餐元数据，例如 Codex `Pro 20x` 或 xAI `SuperGrok`。形状：`{"name": "Pro 20x", "premium": true}`。权威主动探测成功后，如果当前 payload 不再映射到套餐，会清除旧值。 |
+| `plan` | object/null | collector 推导的 Provider 订阅套餐元数据，例如 Codex `Pro 20x` 或 xAI `SuperGrok`。形状：`{"name": "Pro 20x", "premium": true}`；可选 `expires_at` 为上游报告的订阅到期时间（RFC3339 UTC），与额度重置时间及快照有效期分开记录。可选订阅元数据不可用时保留上次套餐；权威响应确认免费档位时，将旧付费套餐替换为 `Free`。 |
 
 额度窗口字段：
 
@@ -3021,7 +3146,7 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `credential_ids` | string array | 仅采集这些 credential ID。 |
-| `providers` | string array | 仅采集这些 provider：`claude`、`antigravity`、`codex`、`kimi`、`xai`、`meta`；`grok` 作为 `xai` alias 接受，`muse` 作为 `meta` alias 接受。其他值返回 `400`。两个过滤条件按 AND 语义组合。 |
+| `providers` | string array | 仅采集这些 provider：`claude`、`antigravity`、`codex`、`devin`、`kimi`、`xai`、`meta`；`grok` 作为 `xai` alias 接受，`muse` 作为 `meta` alias 接受。其他值返回 `400`。两个过滤条件按 AND 语义组合。 |
 
 响应 `202`:
 
@@ -3114,6 +3239,7 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 | `reasoning_effort` | string/null | usage payload 的 reasoning effort。 |
 | `token_breakdown` | object | Token Accounting v2 的互斥输入、输出和未分类 Token 桶；仅在 `capabilities.usage_token_breakdown_v2=true` 时消费。 |
 | `client.client_ip` | string/null | payload 中可关联的调用方 IP；不会被当作 CPA 节点 IP。 |
+| `client.user_agent` | string/null | payload 中上报的调用方 User-Agent。 |
 | `credential.api_key_preview` | string/null | 仅 provider API key 可用时返回脱敏 preview；不会返回 raw key。 |
 | `billing.balance_before` / `billing.balance_after` | number/null | 关联 `billing_charge` 时的扣款前后余额。 |
 | `runtime.home_ip` / `runtime.home_port` | string/integer/null | 写入 usage 的 Home 节点标识。 |
@@ -4040,6 +4166,8 @@ Query 参数：
 
 修改单个 channel 时，向 `/config/oauth/model-alias/claude` 提交原始别名数组；删除时对该路径执行 `DELETE`。v8 不使用 v0 的 `items`、`channel`、`provider`、`aliases` 包装。写入成功返回 `{"status":"ok","config-version":8}`。与其他配置树接口一致，`null` 保留为值，不表示删除。
 
+当下游请求使用了已通过别名发布的上游模型 ID 时，Home 可能在 `auth_not_found` 或 `model_not_found` 错误中附加最多三个可见的对外模型 ID，包括因缺少价格而拒绝的请求。提示覆盖 API Key 和 OAuth 别名，包含必要的凭据前缀，并遵守客户端 Key 的凭据、模型及模型专属渠道权限。禁用凭据、未发布或被排除的模型不会出现在提示中；权限查询失败时省略提示。错误码和路由规则保持不变。
+
 ## 配置字段参考
 
 以下路径使用 v8 配置布局。`/config` 和 `/config.yaml` 支持普通设置及上游 provider 凭证；OAuth auth 文件使用 `/credentials`，客户端访问密钥使用 `/access/api-keys`。
@@ -4106,9 +4234,12 @@ Query 参数：
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
 | `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
 | `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
+| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承父凭证。普通子会话仅在同 provider、同模型内继承；Guardian 请求（`X-Openai-Subagent: guardian`，大小写不敏感）可跨模型继承父会话在合格真实 provider 上最近的有效选择，已有子绑定优先。默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
-| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中进行混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words-replace` | object string to string | 在 system instructions 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
+| `oauth.providers.antigravity.sensitive-patterns-replace` | `{pattern, replacement}` 数组 | 在 system instructions 中按顺序执行的 Go RE2 正则替换规则（`replacement` 为空字符串表示删除匹配内容）。 |
 | `api-keys.gemini` | 分组数组 | 上游 gemini 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.interactions` | 分组数组 | 上游 interactions 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.codex` | 分组数组 | 上游 codex 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
@@ -4136,6 +4267,8 @@ Query 参数：
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
 
+Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有在开启 `session-affinity-subagents` 时成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。关闭后仍保留普通粘性绑定，但不再维护 Guardian 历史，并将本次使用的绑定从该历史中移除。重新开启后从后续成功选择继续记录，不回补关闭期间的选择。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 通过正常启动迁移新增 Guardian 字段及查询索引，并继续支持 v18 可移植快照。会过期的选择元数据及内部会话计数器记录存于现有 `session_affinity` 表内，不新增独立表（均不纳入可移植快照）；升级前的绑定在下一次成功派发时补充选择元数据。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
+
 ### v8 补充字段
 
 下列字段补充前表。`oauth.providers` 下的设置作用于 OAuth 凭证；API Key 选项见上游分组结构。
@@ -4153,10 +4286,9 @@ Query 参数：
 | `server.discovery.advertise-management` | boolean | 是否广播管理接口，默认 `false`。 |
 | `credentials.concurrency` | object | Home 并发限制生命周期和释放调优；revision 只读，见配置章节。 |
 | `credentials.in-flight` | object | 观测快照、过期、大小及暂存限制。 |
-| `routing.session-affinity-subagents` | optional boolean | CPA 的父会话凭证继承兼容选项；Home 继续管理自己的会话层级。 |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA 兼容设置；Home 运行时冷却状态由数据库持久化。 |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | 随配置携带的 CPA 临时错误冷却设置。 |
-| `oauth.providers.aistudio.ws-auth` | boolean | Home 规范化为 `false`。 |
+| `oauth.providers.aistudio.ws-auth` | boolean | 仅兼容保留并规范化为 `false`，不下发给 CPA；Home 模式不提供 `/v1/ws`。 |
 | `oauth.request-scoped-errors` | provider 到 rule array 的对象 | OAuth 请求级错误覆盖规则。 |
 | `upstream.codex.disable-codex-cloaking` | boolean | 不再强制注入 Codex OAuth 和 API Key 请求的官方身份请求头。 |
 | `upstream.codex.stream-bootstrap-buffering` | boolean | 缓冲生成前帧，允许在提交流前切换凭证，默认 `false`。 |
@@ -4180,7 +4312,9 @@ Query 参数：
 | `oauth.providers.antigravity.connection-pool.idle-conn-timeout` | duration string | 空闲超时，默认 `30s`，最大 `210s`。 |
 | `oauth.providers.antigravity.connection-pool.max-idle-conns-per-host` | optional integer | 每凭证每 host 的空闲连接数，默认 `2`。 |
 | `upstream.xai.inject-x-search` | boolean | 请求未提供时注入原生 `x_search`。 |
-| `oauth.providers.devin.sensitive-words` | string array | system prompt/消息中需要混淆的词。 |
+| `oauth.providers.devin.sensitive-words` | string array | system prompt 中匹配后整行剔除的敏感词列表。 |
+| `oauth.providers.devin.sensitive-words-replace` | object string to string | system prompt 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
+| `oauth.providers.devin.sensitive-patterns-replace` | `{pattern, replacement}` 数组 | 在 system prompt 中按顺序执行的 Go RE2 正则替换规则（`replacement` 为空字符串表示删除匹配内容）。 |
 | `oauth.model-alias.*[].display-name` | string | 可选目录显示名覆盖。 |
 | `multimedia.gpt-image-2-base-model` | string | GPT Image 2 请求使用的基础模型。 |
 | `multimedia.video-result-auth-cache-ttl` | duration string | 视频结果与凭证关联缓存的有效期。 |

@@ -60,6 +60,7 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	if refreshToken == "" {
 		return auth, nil
 	}
+
 	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
@@ -77,6 +78,7 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 			auth.Attributes["plan_type"] = planType
 		}
 	}
+	delete(auth.Metadata, codexauth.RefreshOutcomeMetadataKey)
 	auth.Metadata["id_token"] = td.IDToken
 	auth.Metadata["access_token"] = td.AccessToken
 	if td.RefreshToken != "" {

@@ -40,10 +40,27 @@ func TestPublicModelCatalogWithholdsPriceAndAvailability(t *testing.T) {
 	}
 	for _, model := range payload.Models {
 		if model.Pricing != nil {
-			t.Errorf("model %s exposes pricing to an anonymous visitor", model.ID)
+			t.Errorf("model %s exposes pricing to an anonymous visitor when public_model_pricing is false", model.ID)
 		}
 		if model.Availability != nil {
-			t.Errorf("model %s exposes availability to an anonymous visitor", model.ID)
+			t.Errorf("model %s exposes availability to an anonymous visitor when public_model_pricing is false", model.ID)
+		}
+	}
+
+	publicPricing := true
+	if _, errPatch := handler.repo.UpdateBillingSettings(context.Background(), cluster.BillingSettingsPatch{
+		PublicModelPricing: &publicPricing,
+	}); errPatch != nil {
+		t.Fatalf("UpdateBillingSettings(public_model_pricing=true) error = %v", errPatch)
+	}
+
+	publicPayload := getUserModels(t, handler.ListModels, "/models", "")
+	for _, model := range publicPayload.Models {
+		if model.Pricing == nil {
+			t.Errorf("model %s missing public pricing when public_model_pricing is true", model.ID)
+		}
+		if model.Availability == nil {
+			t.Errorf("model %s missing public availability when public_model_pricing is true", model.ID)
 		}
 	}
 }
@@ -271,6 +288,38 @@ func TestAccessibleModelsReturnPriceLadderWithoutOperatorBookkeeping(t *testing.
 	}
 	if foreign.Pricing == nil || foreign.Pricing.Status != pricingStatusUnpublished {
 		t.Errorf("foreign-provider pricing = %+v, want unpublished", foreign.Pricing)
+	}
+
+	// Wildcard rules (provider="*" and trailing model pattern "mystery-*") must
+	// publish pricing for servable models using the same specificity as billing.
+	ctx := context.Background()
+	if _, errWildProv := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
+		Provider:              "*",
+		Model:                 "text-only-model",
+		ServiceTier:           "*",
+		InputPricePerMillion:  1.25,
+		OutputPricePerMillion: 5.0,
+		Enabled:               true,
+	}); errWildProv != nil {
+		t.Fatalf("CreateBillingModelPrice(provider=*) error = %v", errWildProv)
+	}
+	if _, errWildModel := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
+		Provider:              "openai",
+		Model:                 "mystery-*",
+		ServiceTier:           "*",
+		InputPricePerMillion:  0.75,
+		OutputPricePerMillion: 3.0,
+		Enabled:               true,
+	}); errWildModel != nil {
+		t.Fatalf("CreateBillingModelPrice(model=mystery-*) error = %v", errWildModel)
+	}
+	wildcardPayload := getUserModels(t, handler.ListAccessibleModels, "/models/accessible", createUserBillingBearerToken(t, handler, user.ID))
+	wildcardModels := indexUserModelsByID(wildcardPayload.Models)
+	if got := wildcardModels["text-only-model"].Pricing; got == nil || got.Status != pricingStatusPublished || len(got.Providers) != 1 || got.Providers[0].Provider != "openai" || got.Providers[0].Tiers[0].Rungs[0].InputPricePerMillion != 1.25 {
+		t.Fatalf("provider=* catalog pricing = %+v, want published openai @ 1.25", got)
+	}
+	if got := wildcardModels["mystery-model"].Pricing; got == nil || got.Status != pricingStatusPublished || len(got.Providers) != 1 || got.Providers[0].Provider != "openai" || got.Providers[0].Tiers[0].Rungs[0].InputPricePerMillion != 0.75 {
+		t.Fatalf("model=mystery-* catalog pricing = %+v, want published openai @ 0.75", got)
 	}
 }
 
