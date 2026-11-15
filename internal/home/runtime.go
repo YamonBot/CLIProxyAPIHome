@@ -183,11 +183,7 @@ type clusterAuthStateObserver interface {
 }
 
 type clusterUsageStore interface {
-	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
-}
-
-type clusterUsageOutcomeStore interface {
-	StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
+	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
 }
 
 type appLogStore interface {
@@ -511,7 +507,7 @@ func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex, observ
 	if errRefresh != nil {
 		return nil, errRefresh
 	}
-	return BuildRefreshPayload(updated)
+	return BuildRefreshPayload(updated, r.Config())
 }
 
 // UpdateAuthInMemory updates an auth in memory.
@@ -568,24 +564,12 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 	return refresher.RefreshAuthIndex(ctx, uuid)
 }
 
-// PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
-func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
-	persisted, _, errPersist := r.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
-	return persisted, errPersist
-}
-
-// PersistClusterUsagePayloadOutcome stores a cluster usage payload with its trusted receive time
-// and reports whether the payload was newly inserted (false when deduplicated).
-func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, bool, error) {
+// PersistClusterUsagePayload stores a cluster usage payload with its trusted
+// receive time. It reports whether the cluster store handled the payload and
+// whether the payload was newly inserted (false when deduplicated).
+func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (persisted bool, inserted bool, err error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
 		return false, false, nil
-	}
-	if outcomeStore, ok := r.clusterAdapter.(clusterUsageOutcomeStore); ok && outcomeStore != nil {
-		inserted, errStore := outcomeStore.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
-		if errStore != nil {
-			return false, false, errStore
-		}
-		return true, inserted, nil
 	}
 	store, ok := r.clusterAdapter.(clusterUsageStore)
 	if !ok || store == nil {
@@ -593,10 +577,11 @@ func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload
 	}
 	// Acknowledge usage only after its database transaction commits. A failed
 	// write must reach the sender, not disappear from an in-memory queue.
-	if errStore := store.StoreUsagePayload(ctx, payload, receivedAt); errStore != nil {
+	inserted, errStore := store.StoreUsagePayload(ctx, payload, receivedAt)
+	if errStore != nil {
 		return false, false, errStore
 	}
-	return true, true, nil
+	return true, inserted, nil
 }
 
 // PersistAppLogPayload stores a CPA app log payload in the runtime database.
@@ -729,12 +714,15 @@ func (r *Runtime) ListPendingPluginTasks(ctx context.Context, nodeType string, n
 }
 
 // BuildRefreshPayload builds a build refresh payload.
-func BuildRefreshPayload(updated *coreauth.Auth) ([]byte, error) {
+func BuildRefreshPayload(updated *coreauth.Auth, cfg *config.Config) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if updated == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	auth := SanitizeAuthForDownstream(updated)
+	auth, errSanitize := SanitizeAuthForDownstream(updated, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	if auth == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
@@ -920,23 +908,12 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if errAllowed != nil {
 		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
-	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
-	if pinnedAuthID != "" {
-		pinnedAllowed := allowedAuthIDs == nil
-		for _, allowedAuthID := range allowedAuthIDs {
-			if strings.TrimSpace(allowedAuthID) == pinnedAuthID {
-				pinnedAllowed = true
-				break
-			}
-		}
-		allowedAuthIDs = []string{}
-		if pinnedAllowed {
-			allowedAuthIDs = append(allowedAuthIDs, pinnedAuthID)
-		}
-	}
 	metadata := make(map[string]any)
 	if allowedAuthIDs != nil {
 		metadata[coreauth.AllowedAuthIDsMetadataKey] = allowedAuthIDs
+	}
+	if pinnedAuthID = strings.TrimSpace(pinnedAuthID); pinnedAuthID != "" {
+		metadata[coreauth.PinnedAuthIDMetadataKey] = pinnedAuthID
 	}
 	if allowedModelIDs != nil {
 		metadata[coreauth.AllowedModelIDsMetadataKey] = allowedModelIDs
@@ -977,6 +954,23 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("home runtime: no providers available")
 	}
+	for _, provider := range providers {
+		if provider != "antigravity" {
+			continue
+		}
+		until, errPause := r.antigravityTOSPauseDeadline(ctx)
+		if errPause != nil {
+			return nil, fmt.Errorf("read Antigravity pool pause: %w", errPause)
+		}
+		if until.After(time.Now()) {
+			// Keep the provider scope stable for session affinity; only fence candidates.
+			opts.ExcludedProviders = append(append([]string(nil), opts.ExcludedProviders...), "antigravity")
+			if len(providers) == 1 {
+				return nil, &coreauth.Error{Code: "antigravity_tos_pause", Message: "Antigravity credential pool is paused", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
+			}
+		}
+		break
+	}
 
 	if !r.supportsRequestedModel(reqModel) {
 		trimmedModel := strings.TrimSpace(reqModel)
@@ -989,19 +983,16 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
-	// Database-backed admissions commit the binding and the concurrency counter
-	// in one transaction. Standalone dispatch without a limiter can CAS directly.
-	// Legacy custom admitters without a shared store retain selector-side commits.
-	if r.concurrencyAdmitter == nil || r.sessionAffinityStore != nil {
-		opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
-	}
+	// Database-backed admissions commit the binding and concurrency counter in
+	// one transaction. Local/custom stores are committed separately below, but
+	// weighted reservations always remain owned by dispatch until admission ends.
+	opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
+	defer func() { opts.SessionAffinity.Finish(false) }()
 	var lastCandidateError error
 	for {
+		opts.SessionAffinity.Reset()
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
-		}
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = coreauth.SessionAffinitySelection{}
 		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
@@ -1050,8 +1041,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if opts.SessionAffinity != nil {
 			binding = opts.SessionAffinity.Commit
 		}
-		// Explicitly installed local/custom selectors cannot participate in the
-		// database admission transaction. Keep their selector-side CAS behavior.
+		// Local/custom stores cannot participate in the database admission
+		// transaction. Commit their binding before admission instead.
 		if binding != nil && r.concurrencyAdmitter != nil && opts.SessionAffinity.Store != r.sessionAffinityStore {
 			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
 			if errSwap != nil {
@@ -1092,6 +1083,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				if !admission.Accounted {
 					return nil, fmt.Errorf("home runtime: concurrency admission result mismatch")
 				}
+				opts.SessionAffinity.Finish(true)
 				result.Concurrency.Accounted = true
 				result.AdmissionFenceFailure = fmt.Errorf("home runtime: concurrency admission result mismatch")
 				return result, nil
@@ -1106,6 +1098,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				continue
 			}
 		}
+		opts.SessionAffinity.Finish(true)
 		return result, nil
 	}
 }

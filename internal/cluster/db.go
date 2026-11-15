@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,7 +71,7 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 			return nil
 		}))
 	}
-	sqlDB := stdlib.OpenDB(*pgConfig, options...)
+	sqlDB := sql.OpenDB(lifecyclePostgresConnector{Connector: stdlib.GetConnector(*pgConfig, options...)})
 	sqlDB.SetConnMaxLifetime(defaultPostgresConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(defaultPostgresConnMaxIdleTime)
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
@@ -291,8 +292,8 @@ func runCustomMigrations(db *gorm.DB) error {
 		{name: "migrate_user_unique_username", run: migrateUserUniqueUsername},
 		{name: "migrate_user_unique_email", run: migrateUserUniqueEmail},
 		{name: "migrate_auth_next_retry_after", run: migrateAuthNextRetryAfter},
-		{name: "migrate_codex_refresh_outcomes", run: migrateCodexRefreshOutcomes},
 		{name: "migrate_usage_observability_indexes", run: migrateUsageObservabilityIndexes},
+		{name: "migrate_usage_dedupe_keys", run: migrateUsageDedupeKeys},
 		{name: "migrate_usage_provider_api_key_sources", run: migrateUsageProviderAPIKeySources},
 		{name: "migrate_usage_service_tiers", run: migrateUsageServiceTiers},
 		{name: "migrate_legacy_api_keys", run: migrateLegacyAPIKeys},

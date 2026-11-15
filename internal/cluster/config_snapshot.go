@@ -88,7 +88,9 @@ func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context,
 	}
 	ReuseGeneratedProviderCredentialIDs(existing, auths)
 	exported := make(map[string]any, len(explicitKeys))
-	ApplyCredentialConfigToRoot(exported, auths)
+	if _, errApply := ApplyCredentialConfigToRoot(exported, auths); errApply != nil {
+		return errApply
+	}
 	for key := range explicitKeys {
 		if value, exists := exported[key]; exists {
 			values[key] = value
@@ -203,6 +205,7 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg.SanitizeOAuthModelAlias()
 	cfg.SanitizePayloadRules()
 	cfg.SanitizeAntigravity()
+	cfg.SanitizeDevin()
 	if cfg.Pprof.Addr == "" {
 		cfg.Pprof.Addr = appconfig.DefaultPprofAddr
 	}
@@ -339,7 +342,9 @@ func (r *Repository) MutateConfigSnapshot(ctx context.Context, nodeHeartbeatTime
 		if errAuths != nil {
 			return errAuths
 		}
-		ApplyCredentialConfigToRoot(root, auths)
+		if _, errApply := ApplyCredentialConfigToRoot(root, auths); errApply != nil {
+			return errApply
+		}
 		values, errMutate := mutate(root)
 		if errMutate != nil {
 			return errMutate

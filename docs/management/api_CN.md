@@ -259,6 +259,8 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 返回持久化 Home 配置和数据库中上游 API Key 凭证的规范化 v8 视图，包含 `config-version: 8`。这是持久化配置视图，不保证列出所有运行时默认值；未配置的可选字段可以省略。读取响应设置 `Cache-Control: no-store`。
 
+v8 配置 GET（包括子树和 YAML）读取已提交数据，不初始化生命周期配置，也不对其加行锁。初始化和生命周期校验在启动阶段完成；生命周期记录缺失时返回 `500 config_load_failed`，不会在读取时创建默认值。
+
 响应节选：
 
 ```json
@@ -351,7 +353,7 @@ JSON 写入仅在新旧 ICE server 的 `urls` 列表内容和顺序相同时保�
 
 只读路径为 `credentials/concurrency/lifecycle-config-revision`、`credentials/concurrency/observation-barrier-revision` 和 `plugins/auth-revision`。替换包含这些字段的对象时，必须保留它们当前是否存在以及对应的值；直接设置或删除会被拒绝。
 
-Home 将 `observability.usage.usage-statistics-enabled` 规范化为 `true`，将 `oauth.providers.aistudio.ws-auth` 规范化为 `false`。`routing.cooldown.disable-cooling` 仍控制 Home 本地调度冷却，下发给 CPA 的配置独立强制关闭 CPA 本地冷却。`server.port` 配置的是 CPA，运行中的 CPA 需重启才重新绑定端口；Home 监听仍使用 `-addr` 或 `cluster.yaml` 的 `node.port`。`oauth.auth-dir` 仍是导入导出路径，不是运行时文件写入位置。
+Home 将 `observability.usage.usage-statistics-enabled` 规范化为 `true`。旧的 `oauth.providers.aistudio.ws-auth` 仅为兼容保留并规范化为 `false`，不再下发；CPA 在 Home 模式下不提供 `/v1/ws`。`routing.cooldown.disable-cooling` 仍控制 Home 本地调度冷却，下发给 CPA 的配置独立强制关闭 CPA 本地冷却。`server.port` 配置的是 CPA，运行中的 CPA 需重启才重新绑定端口；Home 监听仍使用 `-addr` 或 `cluster.yaml` 的 `node.port`。`oauth.auth-dir` 仍是导入导出路径，不是运行时文件写入位置。
 
 ### 模型目录来源
 
@@ -379,7 +381,13 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 `PATCH /config/oauth/providers/antigravity` 请求体示例：
 
 ```json
-{ "sensitive-words": ["API", "proxy"], "connection-pool": { "enabled": true } }
+{
+  "sensitive-words": ["API", "proxy"],
+  "sensitive-words-replace": {
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+  },
+  "connection-pool": { "enabled": true }
+}
 ```
 
 `oauth.providers` 下的设置仅作用于 OAuth。API Key 凭证使用自己的分组/key 选项，不会隐式继承 v8 OAuth provider 配置。
@@ -397,6 +405,33 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 Home 在数据库和下发配置中保留兼容的
 运行时字段投影，让当前依赖的 CPA SDK 也能消费共享值。
 
+#### Home 策略与 CPA 执行配置
+
+现有配置接口也支持下列字段。所有值均持久化到数据库，并在配置读取和导入导出中保留。显式的 `false`、`0`、空集合和 `null` 会原样保留，SDK 默认值不会回写。CPA 执行字段依据 Home 当前依赖的 CPA SDK 版本校验，因此升级 SDK 通常即可支持新选项，无需改动 Home；未知字段仍被拒绝。标为 CPA 的配置仅由 Home 保存和下发，不会作用于 Home 自身的 HTTP 服务或上游连接；旧 CPA 节点可能忽略尚未支持的选项。
+
+| 范围 | 字段 |
+| --- | --- |
+| Home 调度 | `routing.session-affinity-rebind-on`；`oauth.providers.antigravity.tos-pause-window` |
+| Home 模型目录 | `oauth.settings.<provider>[]`（`name`、可选 `alias`、`max-context-length`） |
+| CPA 服务 | `server.max-request-body-bytes`、`server.response-compression.enabled/min-bytes`、`server.shutdown-timeout`、`server.github-token` |
+| CPA 客户端兼容 | `client.codex.enable-apply-patch`、`client.codex.web-search-result-cache.enabled/ttl/limit`、`client.claude.show-codex-commentary` |
+| CPA Codex 执行 | `upstream.codex.upstream-request-compression`、`upstream.codex.upstream-request-compression-min-bytes`、`upstream.codex.websocket-compression`；`oauth.providers.codex.signin-with-chatgpt-identifier` |
+| CPA Claude 执行 | `upstream.claude.server-side-fallback`、`upstream.claude.session-date-pin-days`（仅内存模式；使用 Home KV 时忽略）；`upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA 提示词策略 | `oauth.providers.antigravity.sensitive-patterns-replace`、`oauth.providers.devin.sensitive-patterns-replace`、`api-keys.claude[].keys[].cloak.sensitive-patterns-replace`；按顺序执行的 `{pattern, replacement}` Go RE2 规则 |
+| 凭证执行选项 | `api-keys.<provider>[].connection-pool`（组级和单 Key）；`api-keys.vertex[].interactions`；`api-keys.vertex[].models[].openapi`；`oauth.model-alias.vertex[].openapi` |
+
+`routing.session-affinity-rebind-on` 控制已绑定凭证不可用时的切换行为：`any`（默认）在任何切换时重新绑定；`quota` 在临时故障时保留原绑定，仅在配额、认证或模型支持错误时重绑；`never` 拒绝从仍有效的绑定切换。可用提供商变化不会改变会话绑定作用域：禁用已绑定提供商的最后一个凭证时，`never` 会拒绝调度；启用其他提供商也不会替换健康绑定。过期绑定始终可以重新选择。重绑定只依据请求模型的当前故障或凭证级阻断；`quota` 下临时的并发避让或重试排除不会触发重绑。
+
+`tos-pause-window` 在 Home 中默认 `0`（关闭）。省略或留空时显式下发 `"0"`，避免 CPA 节点回退到自身默认值；显式非空值保持不变。设置 `6h` 等正时长可启用；设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
+
+`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。匹配 `alias` 的条目优先于匹配原名 `name` 的条目。不影响 API Key 模型。
+
+`connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
+
+`api-keys.vertex[].models[].openapi` 和 `oauth.model-alias.vertex[].openapi` 的显式 `true`/`false` 会在凭证下发时投影到 `vertex_model_openapi` 属性；未设置或 `null` 时保留 CPA 的自动路由。凭证级规则优先于 OAuth 别名规则，别名规则不影响 API Key 凭证。删除设置后，下次派发或刷新即不再携带该投影，无需重写数据库凭证。凭证执行选项格式损坏时，合成、派发或刷新会明确失败，不会静默丢弃。
+
+`server.github-token` 是下发给可信 CPA 节点的秘密，不是 Home 管理密钥。凭证身份、秘密和调度信息仍保存在 Auth 记录中；凭证的原始私有配置仅保留供导出，不随凭证下发给 CPA。
+
 #### Credential concurrency lifecycle 字段
 
 两个配置响应都包含 `credentials.concurrency` 对象。`lifecycle-config-revision` 和 `observation-barrier-revision` 由 Home 管理：替换整个配置或该子树时，客户端必须保留这两个字段的当前值；Home 从单例记录派生它们。observation barrier 初始为 `0`，在 policy 变更时单调递增，Home 始终下发当前值。不能通过 YAML import 或 Management API 修改这两个 revision。
@@ -411,6 +446,8 @@ Home 在数据库和下发配置中保留兼容的
 | `cleanup-interval` | `5s` | lifecycle cleanup interval。 |
 
 所有 duration 必须为正数。Home 还要求 `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`，duration 求和溢出也会被视为无效。存在状态为 `active` 或 `canceling` 的 CPA membership 时，仅对 `cpa-heartbeat-timeout`、`cpa-cancel-bound`、`reclaim-grace` 或 `cleanup-interval` 的变更返回 `lifecycle configuration is in use`；完全相同的配置会按未变更接受，非安全时序调优字段仍可更新。
+
+订阅仅在 Home 成功持久化存活状态后续期心跳期限。临时数据库超时会跳过 PONG，不立即隔离订阅；但如果在该 membership 的 `cpa-heartbeat-timeout` 内始终未能成功持久化，Home 会独立计时并隔离该精确 lifetime。期限由 lifetime 持有：订阅断线或退订不能取消期限，且期限在客户端数量同步或初始消息发送之前注册。即使数据库不可用，到期也会取消关联命令连接和本地任务。配置/集群消息和 RTT 回显均不能延长期限；明确的 membership 失效或 Home fencing 仍立即触发隔离。此 Home 侧保护兼容现有 CPA 客户端；更新后的 CPA 客户端同样仅允许有效心跳 PONG 续期接收期限。
 
 ## 节点、版本和证书
 
@@ -2031,6 +2068,12 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 
 每个 key 可设置整数 `weight`，缺省为 `1`，最大 `1000000`；非正数仅在启用加权调度时排除该凭证。权重属于 key，不能放在分组上。配置 key 列表中的显式 `null`、字符串和小数均不合法。OAuth/文件凭证可在上传的 auth JSON 顶层携带数值 `weight`。
 
+开启 `routing.session-affinity` 后，粘性命中（包括继承父会话绑定）的请求也会消耗权重额度，但不会为了均衡迁移已有绑定；新建或重新选择的会话优先分配给低于目标份额的凭证。不同优先级层、allowlist、重试排除和冷却子集按实际候选凭证集合隔离额度，回到原候选池时继续使用保留额度。粘性请求只与绑定凭证同优先级层的可用凭证记账，固定凭证（pinned）请求在固定凭证所属优先级层内按固定前的合格候选池记账，低优先级绑定不会改变高优先级凭证之间的比例。
+
+结算后的额度限制在候选池总权重的 ±32 倍，因此请求比例是近似目标而非严格保证。粘性请求的完整额度增量无法放入上限时，保留绑定但不预留、不记账；新会话继续赚取额度和偿还欠额，避免超额粘性流量饿死小权重凭证。并发选择能看到未提交的预留；存在未结算预留时，已提交余额可暂时超出上限，抵消额度保留至整个池结算完毕，最后一个预留回滚也会触发裁剪。绑定提交及并发准入成功后确认预留，失败或重试时释放，不消耗已提交额度。
+
+额度保存在各 Home 进程内，进程重启、选择器替换或有界候选池缓存淘汰后重置；权重变化会重置对应池额度并使该池的旧预留失效。数据库共享绑定不变。
+
 ### Provider 专属 Key 选项
 
 | 字段 | Provider | 含义 |
@@ -2038,7 +2081,7 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 | `disable-codex-cloaking` | Codex | 可选布尔值，控制该 API Key 凭证的 Codex 身份请求头。 |
 | `websockets` | Codex、xAI | 启用 Responses WebSocket 传输。 |
 | `alpha-search` | Codex | 允许 `/v1/alpha/search` 通过配置的上游 `/alpha/search` 执行。 |
-| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`cache-user-id` 的对象。 |
+| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`sensitive-words-replace`、`sensitive-patterns-replace`、`cache-user-id` 的对象。 |
 | `experimental-cch-signing` | Claude | 兼容保留；支持的直连上游已自动签名。 |
 | `rebuild-mid-system-message` | Claude | 重建会话正文中间的 system 消息。 |
 | `native-tool-search` | Claude | 信任自定义 base URL 支持 Anthropic 原生 tool search（`defer_loading` + `tool_reference`），用于 Codex `tool_search`；官方 `api.anthropic.com` 凭证自动启用。需要开启 `upstream.claude.tool-search`。 |
@@ -2463,9 +2506,11 @@ Selector 字段：
 
 批量请求即使部分刷新失败也返回 `200`，应检查 `results[].success`。输入错误返回 `400`，单凭证不存在返回 `404`，单凭证刷新失败返回 `500 refresh_failed`，协调器不可用返回 `503`。
 
-Codex 刷新中断或响应无法读取、解析时，刷新结果可能处于不确定状态。Home 在发送请求前，先在数据库中占用该刷新凭证。对于等待结果或结果不明的凭证，即使租约到期、服务重启，或删除后重新导入相同凭证，也不会重新提交；只有确定请求尚未发送的失败才会解除占用。Home 使用 `refresh_outcome_unknown` 单独记录这种状态，不会将其视为刷新凭证被明确拒绝。恢复时需要重新连接 Codex 或导入替换后的刷新凭证；等待重试退避结束不能消除结果的不确定性。
+Codex 刷新对临时网络错误、响应读取或解析失败、未返回有效 access token 等情况进行有限次数重试。重试耗尽后进入正常刷新退避，后续仍可再次尝试。提供方明确拒绝凭证（`invalid_grant`、refresh token 过期、撤销或已复用）时仍需要恢复凭证；仅未获取到 access token 不再要求更换凭证。
 
-刷新成功后，Home 先保存结果回执，再发布更新后的凭证。后续使用旧刷新凭证的调用会复用尚未过期的结果，并沿已记录的轮换链获取更新的凭证。回执过期后需要恢复，即使提供方曾返回相同的 refresh token。`codex_refresh_journal` 表包含凭证，已纳入 v17 数据库快照；备份和迁移时必须与认证数据库一同保护、保留。仅导出认证目录无法保留这段历史。升级前应停止旧版 Home 进程，也不要通过未共享此数据库协议的部署或外部客户端刷新相同凭证。启动迁移会将与当前凭据匹配的旧 metadata 保护标记写入日志。旧租约本身无法标识已经使用的刷新凭据；对于此前未留下凭据指纹记录的刷新交换，日志无法重建其历史。
+并发 Codex 刷新的等待方会独立响应自身取消或超时，不会取消共享刷新或其他调用者。发起方保留刷新结果，包括已返回的令牌轮换结果。
+
+Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_refresh_outcomes` metadata 和 `codex_refresh_journal` 记录不再阻止刷新。日志表仅为兼容旧数据库和快照（包括 v17 备份）而保留；历史回执可能包含凭证，已有数据库备份仍需妥善保护。
 
 ### GET `/oauth/auth-url`
 
@@ -4189,9 +4234,12 @@ Query 参数：
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
 | `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
 | `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
+| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承父凭证。普通子会话仅在同 provider、同模型内继承；Guardian 请求（`X-Openai-Subagent: guardian`，大小写不敏感）可跨模型继承父会话在合格真实 provider 上最近的有效选择，已有子绑定优先。默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
-| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中进行混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words-replace` | object string to string | 在 system instructions 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
+| `oauth.providers.antigravity.sensitive-patterns-replace` | `{pattern, replacement}` 数组 | 在 system instructions 中按顺序执行的 Go RE2 正则替换规则（`replacement` 为空字符串表示删除匹配内容）。 |
 | `api-keys.gemini` | 分组数组 | 上游 gemini 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.interactions` | 分组数组 | 上游 interactions 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.codex` | 分组数组 | 上游 codex 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
@@ -4219,6 +4267,8 @@ Query 参数：
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
 
+Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有在开启 `session-affinity-subagents` 时成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。关闭后仍保留普通粘性绑定，但不再维护 Guardian 历史，并将本次使用的绑定从该历史中移除。重新开启后从后续成功选择继续记录，不回补关闭期间的选择。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 通过正常启动迁移新增 Guardian 字段及查询索引，并继续支持 v18 可移植快照。会过期的选择元数据及内部会话计数器记录存于现有 `session_affinity` 表内，不新增独立表（均不纳入可移植快照）；升级前的绑定在下一次成功派发时补充选择元数据。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
+
 ### v8 补充字段
 
 下列字段补充前表。`oauth.providers` 下的设置作用于 OAuth 凭证；API Key 选项见上游分组结构。
@@ -4236,10 +4286,9 @@ Query 参数：
 | `server.discovery.advertise-management` | boolean | 是否广播管理接口，默认 `false`。 |
 | `credentials.concurrency` | object | Home 并发限制生命周期和释放调优；revision 只读，见配置章节。 |
 | `credentials.in-flight` | object | 观测快照、过期、大小及暂存限制。 |
-| `routing.session-affinity-subagents` | optional boolean | CPA 的父会话凭证继承兼容选项；Home 继续管理自己的会话层级。 |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA 兼容设置；Home 运行时冷却状态由数据库持久化。 |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | 随配置携带的 CPA 临时错误冷却设置。 |
-| `oauth.providers.aistudio.ws-auth` | boolean | Home 规范化为 `false`。 |
+| `oauth.providers.aistudio.ws-auth` | boolean | 仅兼容保留并规范化为 `false`，不下发给 CPA；Home 模式不提供 `/v1/ws`。 |
 | `oauth.request-scoped-errors` | provider 到 rule array 的对象 | OAuth 请求级错误覆盖规则。 |
 | `upstream.codex.disable-codex-cloaking` | boolean | 不再强制注入 Codex OAuth 和 API Key 请求的官方身份请求头。 |
 | `upstream.codex.stream-bootstrap-buffering` | boolean | 缓冲生成前帧，允许在提交流前切换凭证，默认 `false`。 |
@@ -4263,7 +4312,9 @@ Query 参数：
 | `oauth.providers.antigravity.connection-pool.idle-conn-timeout` | duration string | 空闲超时，默认 `30s`，最大 `210s`。 |
 | `oauth.providers.antigravity.connection-pool.max-idle-conns-per-host` | optional integer | 每凭证每 host 的空闲连接数，默认 `2`。 |
 | `upstream.xai.inject-x-search` | boolean | 请求未提供时注入原生 `x_search`。 |
-| `oauth.providers.devin.sensitive-words` | string array | system prompt/消息中需要混淆的词。 |
+| `oauth.providers.devin.sensitive-words` | string array | system prompt 中匹配后整行剔除的敏感词列表。 |
+| `oauth.providers.devin.sensitive-words-replace` | object string to string | system prompt 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
+| `oauth.providers.devin.sensitive-patterns-replace` | `{pattern, replacement}` 数组 | 在 system prompt 中按顺序执行的 Go RE2 正则替换规则（`replacement` 为空字符串表示删除匹配内容）。 |
 | `oauth.model-alias.*[].display-name` | string | 可选目录显示名覆盖。 |
 | `multimedia.gpt-image-2-base-model` | string | GPT Image 2 请求使用的基础模型。 |
 | `multimedia.video-result-auth-cache-ttl` | duration string | 视频结果与凭证关联缓存的有效期。 |

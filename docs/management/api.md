@@ -259,6 +259,8 @@ The following v8 routes are derived from `internal/managementhttp/routes_v8.go` 
 
 Returns the normalized v8 view of persisted Home configuration and DB-backed upstream API-key credentials, with `config-version: 8`. This is a persisted configuration view, not a dump of every effective runtime default. Optional absent fields can be omitted. Reads set `Cache-Control: no-store`.
 
+V8 configuration GETs (including subtrees and YAML) read committed data without initializing or taking row locks on lifecycle configuration. Initialization and lifecycle validation happen at startup; a missing lifecycle row returns `500 config_load_failed` rather than creating defaults during a read.
+
 Example response excerpt:
 
 ```json
@@ -351,7 +353,7 @@ JSON writes preserve omitted TURN `username`/`credential` values only when the n
 
 The read-only paths are `credentials/concurrency/lifecycle-config-revision`, `credentials/concurrency/observation-barrier-revision`, and `plugins/auth-revision`. Preserve their current presence and value when replacing a containing object. Setting or removing them directly is rejected.
 
-Home normalizes `observability.usage.usage-statistics-enabled` to `true` and `oauth.providers.aistudio.ws-auth` to `false`. `routing.cooldown.disable-cooling` remains Home's local scheduling policy; downstream CPA configuration independently forces local CPA cooling off. `server.port` configures CPA, and running CPA processes need a restart to rebind; Home's listener still uses `-addr` or `cluster.yaml` / `node.port`. `oauth.auth-dir` remains an import/export path, not a runtime file-write destination.
+Home normalizes `observability.usage.usage-statistics-enabled` to `true`. The legacy `oauth.providers.aistudio.ws-auth` switch is normalized to `false` for compatibility but is not distributed: CPA does not expose `/v1/ws` in Home mode. `routing.cooldown.disable-cooling` remains Home's local scheduling policy; downstream CPA configuration independently forces local CPA cooling off. `server.port` configures CPA, and running CPA processes need a restart to rebind; Home's listener still uses `-addr` or `cluster.yaml` / `node.port`. `oauth.auth-dir` remains an import/export path, not a runtime file-write destination.
 
 ### Model Catalog Sources
 
@@ -379,7 +381,13 @@ Example `PUT /config/requests/payload/filter` body:
 Example `PATCH /config/oauth/providers/antigravity` body:
 
 ```json
-{ "sensitive-words": ["API", "proxy"], "connection-pool": { "enabled": true } }
+{
+  "sensitive-words": ["API", "proxy"],
+  "sensitive-words-replace": {
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+  },
+  "connection-pool": { "enabled": true }
+}
 ```
 
 Settings under `oauth.providers` are OAuth-scoped. API-key credentials use their own group/key options; the v8 OAuth provider settings do not implicitly configure API-key credentials.
@@ -398,6 +406,33 @@ OAuth fields otherwise precede flat fields. v8 reads and successful mutations
 use canonical names. Home persists and publishes a compatible legacy runtime
 projection so the bundled CPA SDK can consume the shared values.
 
+#### Home policies and CPA execution settings
+
+The config endpoints also accept the fields below. All values are database-backed and round-trip through config reads and import/export. Explicit `false`, `0`, empty collections, and `null` are preserved; SDK defaults are not written back. CPA execution fields are validated against the CPA SDK version pinned in Home, so an SDK update normally exposes new options without Home changes; unknown fields are still rejected. CPA-only settings are stored and distributed by Home but never applied to Home's own HTTP server or upstream connections, and older CPA nodes may ignore options they do not support.
+
+| Scope | Fields |
+| --- | --- |
+| Home scheduling | `routing.session-affinity-rebind-on`; `oauth.providers.antigravity.tos-pause-window` |
+| Home model catalog | `oauth.settings.<provider>[]` (`name`, optional `alias`, `max-context-length`) |
+| CPA server | `server.max-request-body-bytes`, `server.response-compression.enabled/min-bytes`, `server.shutdown-timeout`, `server.github-token` |
+| CPA client compatibility | `client.codex.enable-apply-patch`, `client.codex.web-search-result-cache.enabled/ttl/limit`, `client.claude.show-codex-commentary` |
+| CPA Codex execution | `upstream.codex.upstream-request-compression`, `upstream.codex.upstream-request-compression-min-bytes`, `upstream.codex.websocket-compression`; `oauth.providers.codex.signin-with-chatgpt-identifier` |
+| CPA Claude execution | `upstream.claude.server-side-fallback`, `upstream.claude.session-date-pin-days` (in-memory mode only; ignored with Home KV); `upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA prompt policies | `oauth.providers.antigravity.sensitive-patterns-replace`, `oauth.providers.devin.sensitive-patterns-replace`, `api-keys.claude[].keys[].cloak.sensitive-patterns-replace`; ordered `{pattern, replacement}` Go RE2 rules |
+| Credential execution options | `api-keys.<provider>[].connection-pool` (group and per-key); `api-keys.vertex[].interactions`; `api-keys.vertex[].models[].openapi`; `oauth.model-alias.vertex[].openapi` |
+
+`routing.session-affinity-rebind-on` controls failover when a bound credential is unavailable: `any` (default) rebinds on any failover; `quota` keeps the binding through transient failures and rebinds only for quota, authentication, or model-support failures; `never` refuses to fail over from a live binding. Changes to available providers do not change the session binding scope: disabling the bound provider's last credential rejects dispatch under `never`, while enabling another provider does not replace a healthy binding. Expired bindings are always eligible for reselection. Only current failures for the requested model, or a credential-wide fence, count; temporary concurrency or retry exclusions do not trigger a rebind under `quota`.
+
+`tos-pause-window` defaults to `0` (disabled) in Home. Omitted or blank values are explicitly distributed as `"0"` so CPA nodes do not fall back to their own default; explicit non-blank values are preserved. Set a positive duration such as `6h` to enable it; `0`, `off`, `false`, `none`, or `disabled` turns it off. A Google RPC 403 `PERMISSION_DENIED` with `ErrorInfo.reason=TOS_VIOLATION` pauses the whole Antigravity pool for the window. During the pause Home excludes only Antigravity candidates; bindings to other providers stay valid, including under `never`.
+
+`oauth.settings.<provider>[]` overrides `max-context-length` for OAuth models and is applied after exclusions and aliases, before prefixes. An entry matching an `alias` takes precedence over one matching the original `name`. API-key models are not affected.
+
+`connection-pool` is opt-in: an empty `connection-pool: {}` enables CPA defaults (`idle-conn-timeout: 300s`, `max-idle-conns-per-host: 2`). Fields are `enabled`, `idle-conn-timeout`, and `max-idle-conns-per-host`. Per-key values override the group; omitted or `null` fields inherit, and `enabled: false` opts a key out. The effective options travel with each dispatched credential; Home itself never opens these pools.
+
+Explicit `true`/`false` values of `api-keys.vertex[].models[].openapi` and `oauth.model-alias.vertex[].openapi` are projected into the dispatched credential's `vertex_model_openapi` attribute; omitted or `null` keeps CPA's automatic routing. Credential-level rules take precedence over OAuth alias rules, and alias rules do not affect API-key credentials. Removing a setting drops the projection on the next dispatch or refresh without rewriting stored credentials. Malformed credential execution options fail synthesis, dispatch, or refresh instead of being silently dropped.
+
+`server.github-token` is a secret distributed to trusted CPA nodes, not a Home management key. Credential identity, secrets, and scheduling stay on auth records; private original credential configuration is retained for export but excluded from CPA payloads.
+
 #### Credential concurrency lifecycle fields
 
 The `credentials.concurrency` object is included in both config responses. Home owns `lifecycle-config-revision` and `observation-barrier-revision`: clients must preserve their current values when replacing this subtree or the full config; Home derives both values from singleton records. The observation barrier starts at `0`, increases monotonically when policies change, and Home publishes its current value. Neither revision can be changed through YAML import or Management API updates.
@@ -412,6 +447,8 @@ The `credentials.concurrency` object is included in both config responses. Home 
 | `cleanup-interval` | `5s` | Lifecycle cleanup interval. |
 
 All durations must be positive. Home also requires `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`, rejecting duration-sum overflow as invalid. While any CPA membership is `active` or `canceling`, changes to `cpa-heartbeat-timeout`, `cpa-cancel-bound`, `reclaim-grace`, or `cleanup-interval` are rejected with `lifecycle configuration is in use`. An identical configuration is accepted as unchanged, and non-safety tuning fields may still be updated.
+
+A subscription renews its heartbeat deadline only after Home successfully persists its liveness. A transient database timeout withholds PONG without immediately fencing the subscription, but Home independently fences the exact lifetime once its membership `cpa-heartbeat-timeout` elapses without successful persistence. The deadline belongs to the lifetime: subscription disconnect or unsubscribe cannot cancel it, and it is registered before client-count synchronization or initial delivery. Expiry also cancels associated command connections and local tasks, even while the database is unavailable. Configuration/cluster messages and RTT echoes do not extend this deadline. Explicit membership invalidation or Home fencing still causes immediate fencing. This Home-side protection also applies to existing CPA clients; updated CPA clients likewise renew their receive deadline only on valid heartbeat PONGs.
 
 ## Nodes, Version, and Certificates
 
@@ -2040,6 +2077,12 @@ Set `routing.strategy` to `weighted-round-robin` to enable weighted credential s
 
 Each key can specify integer `weight`; omission defaults to `1`, the maximum is `1000000`, and non-positive values exclude the credential only while weighted routing is active. Weight belongs to each key, not to the group. Explicit `null`, strings, and fractional values are invalid in config key lists. OAuth/file credentials can carry a top-level numeric `weight` in their uploaded auth JSON.
 
+With `routing.session-affinity` enabled, sticky requests (including parent-session inheritance) also consume weighted credits without moving existing bindings; new or reselected sessions favor under-served credentials. Each eligible credential set keeps separate credits across priority tiers, allowlists, retry exclusions, and cooldown subsets; returning to a set resumes its retained credits. Sticky accounting uses available peers in the bound credential's priority tier, and pinned requests account against the eligible pool before pinning within the pinned credential's priority tier, so a lower-priority binding never changes the ratio among higher-priority credentials.
+
+Settled credits are capped at ±32 times the pool's total weight, so request ratios are approximate rather than guaranteed. Sticky requests retain their binding but skip reservation/accounting when their full credit delta cannot fit the cap; new sessions continue earning credit and repaying debt so excessive sticky traffic does not starve smaller-weight peers. Concurrent selections see pending allocations. Committed balances may temporarily exceed the cap while reservations remain in flight; offsets stay intact until the pool settles, including a final rollback. Successful binding/admission confirms the reservation; failure or retry releases it without consuming committed credits.
+
+Credits remain local to each Home process and reset on restart, selector replacement, or bounded pool-cache eviction; changing weights resets that pool's credits and invalidates its pending reservations. Shared database bindings are unchanged.
+
 ### Provider-specific Key Options
 
 | Field | Provider | Meaning |
@@ -2047,7 +2090,7 @@ Each key can specify integer `weight`; omission defaults to `1`, the maximum is 
 | `disable-codex-cloaking` | Codex | Optional boolean controlling Codex identity headers for this API-key credential. |
 | `websockets` | Codex, xAI | Enables Responses WebSocket transport. |
 | `alpha-search` | Codex | Allows `/v1/alpha/search` through the configured upstream `/alpha/search`. |
-| `cloak` | Claude | Object with `mode`, `strict-mode`, `sensitive-words`, and `cache-user-id`. |
+| `cloak` | Claude | Object with `mode`, `strict-mode`, `sensitive-words`, `sensitive-words-replace`, `sensitive-patterns-replace`, and `cache-user-id`. |
 | `experimental-cch-signing` | Claude | Retained for compatibility; signing is automatic on supported direct upstreams. |
 | `rebuild-mid-system-message` | Claude | Rebuilds system messages found in the conversation body. |
 | `native-tool-search` | Claude | Trusts a custom base URL with Anthropic native tool search (`defer_loading` + `tool_reference`) for Codex `tool_search`; official `api.anthropic.com` keys use it automatically. Requires `upstream.claude.tool-search: true`. |
@@ -2473,9 +2516,11 @@ Single-credential success returns `{"ok":true,"auth":{...}}`, where `auth` has t
 
 Batch requests return `200` even when individual refreshes fail; inspect `results[].success`. Invalid input returns `400`, an unknown single credential returns `404`, a failed single refresh returns `500 refresh_failed`, and an unavailable coordinator returns `503`.
 
-An interrupted or unreadable Codex refresh can leave its outcome unknown. Home claims each refresh grant in its database before sending the request. Pending or unknown grants are not resubmitted after a lease expires, a restart, or deletion and re-import of the same credentials. Only a proven pre-submission failure releases a claim. Home records `refresh_outcome_unknown` separately from an explicit rejected grant. Reconnect Codex or import replacement refresh credentials to recover; waiting for a retry backoff does not resolve an unknown exchange.
+Codex refresh uses bounded provider retries for transient transport, response-read, decoding, and missing-access-token failures. Exhausted attempts enter the normal refresh backoff and remain retryable. Explicit grant rejection (`invalid_grant`, expired, revoked, or reused refresh tokens) still requires credential recovery. A missing access token alone does not require replacement credentials.
 
-Successful refresh results are saved before updated credentials are published. Later callers with the old grant reuse an unexpired result and follow recorded rotations. An expired result requires recovery, including when the provider returned the same refresh token. The `codex_refresh_journal` table is part of database snapshot format v17 and contains credentials; protect and retain it with the auth database across backups and migrations. Auth-directory exports alone do not preserve this history. Stop older Home processes before upgrading, and do not refresh the same grants through deployments or external clients that do not share this database protocol. Startup migration preserves existing grant-matched metadata fences in the journal. A legacy lease alone does not identify the consumed grant; earlier exchanges without grant-specific evidence cannot be reconstructed.
+Concurrent Codex refresh waiters honor their own cancellation and deadlines without canceling the shared exchange or other callers. The initiating caller retains the exchange outcome, including any returned token rotation.
+
+Home retains its existing refresh lease coordination and concurrent credential-update protections. Legacy `codex_refresh_outcomes` metadata and `codex_refresh_journal` entries no longer block refresh attempts. The legacy journal table remains part of database snapshots for compatibility with v17 backups; historical receipts can contain credentials, so protect existing database backups accordingly.
 
 ### GET `/oauth/auth-url`
 
@@ -4205,9 +4250,12 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `routing.strategy` | string | `round-robin`, `weighted-round-robin`, or `fill-first`. |
 | `routing.session-affinity` | boolean | Database-backed session-sticky credential routing, shared across Home nodes using the same database. Bindings survive config reloads and restarts; unavailable credentials may be reselected. Upgrade all Home nodes to enable cluster-wide consistency. |
 | `routing.session-affinity-ttl` | string | Session-to-auth idle timeout, renewed by successful dispatches. Default: `1h`. |
+| `routing.session-affinity-subagents` | optional boolean | Controls Home parent-credential inheritance for unbound child sessions. Ordinary children inherit within the same provider/model; Guardian requests (`X-Openai-Subagent: guardian`, case-insensitive) can inherit the parent session's latest live selection across models on eligible real providers. Existing child bindings take precedence. Default: `true`; ignored when `session-affinity` is disabled. `false` uses normal credential selection without clearing existing child bindings or disabling fork, compaction, and content-hash fallbacks; it does not force a different credential from the parent. Applies on config reload. Upgrade all Home nodes before relying on this switch cluster-wide. CPA must forward fork/compaction markers (`node_kind` / `X-Node-Kind`) when they are not present in the original headers. |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
-| `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate with zero-width characters in system instructions. |
+| `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate in system instructions. |
+| `oauth.providers.antigravity.sensitive-words-replace` | object string to string | Target-to-replacement string map applied to system instructions (empty string deletes the matched phrase). |
+| `oauth.providers.antigravity.sensitive-patterns-replace` | array of `{pattern, replacement}` | Ordered Go RE2 regex replacements applied to system instructions (empty `replacement` deletes matches). |
 | `api-keys.gemini` | array of groups | Upstream gemini groups with `keys`; see the provider configuration section. |
 | `api-keys.interactions` | array of groups | Upstream interactions groups with `keys`; see the provider configuration section. |
 | `api-keys.codex` | array of groups | Upstream codex groups with `keys`; see the provider configuration section. |
@@ -4235,6 +4283,8 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `requests.payload.override-raw` | array of `PayloadRule` | Overrides raw JSON payload params. |
 | `requests.payload.filter` | array of `PayloadFilterRule` | Removes JSON payload paths. |
 
+Guardian selection history is database-backed and shared across Home nodes, config reloads, and restarts. Only successful dispatch/admission while `session-affinity-subagents` is enabled advances selection order; completion/usage reports and parent lookups do not. When disabled, dispatch keeps ordinary sticky bindings but stops maintaining Guardian history and removes the touched binding from that history. Re-enabling resumes recording subsequent selections; selections made while disabled are not reconstructed. Inherited credentials must still belong to the current request's eligible candidate set. Guardian bindings may reuse a lower-priority eligible credential; cold selection still uses normal priority rules. Fork/compaction requests do not use Guardian cross-model inheritance. Schema version 19 adds the Guardian columns and lookup index through the normal startup migration. Version 18 portable snapshots remain supported. Expiring selection metadata and internal per-session counters use the existing `session_affinity` table, without a separate table (all excluded from portable snapshots); pre-upgrade bindings acquire selection metadata on their next successful dispatch. Upgrade all Home nodes before relying on cross-node Guardian inheritance.
+
 ### Additional v8 Fields
 
 These fields supplement the reference above. Settings under `oauth.providers` apply to OAuth credentials; API-key options are documented in the upstream group schema.
@@ -4252,10 +4302,9 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `server.discovery.advertise-management` | boolean | Advertises management endpoints; defaults to `false`. |
 | `credentials.concurrency` | object | Home-owned limiter lifecycle and release tuning. Revision fields are read-only; see the configuration section. |
 | `credentials.in-flight` | object | Observation snapshot, staleness, size, and staging limits. |
-| `routing.session-affinity-subagents` | optional boolean | CPA compatibility option for parent-session credential inheritance; Home continues to manage its own session hierarchy. |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA compatibility setting; Home runtime cooldown state is DB-backed. |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | CPA transient-error cooldown setting carried with configuration. |
-| `oauth.providers.aistudio.ws-auth` | boolean | Home normalizes this to `false`. |
+| `oauth.providers.aistudio.ws-auth` | boolean | Compatibility only; normalized to `false`, never distributed to CPA. `/v1/ws` is unavailable in Home mode. |
 | `oauth.request-scoped-errors` | provider-to-rule-array object | OAuth request-scoped error overrides. |
 | `upstream.codex.disable-codex-cloaking` | boolean | Disables forcing official identity headers for Codex OAuth and API-key requests. |
 | `upstream.codex.stream-bootstrap-buffering` | boolean | Buffers pre-generation frames to allow failover before committing a stream; default `false`. |
@@ -4279,7 +4328,9 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `oauth.providers.antigravity.connection-pool.idle-conn-timeout` | duration string | Idle timeout, default `30s`, capped at `210s`. |
 | `oauth.providers.antigravity.connection-pool.max-idle-conns-per-host` | optional integer | Idle connections per host per credential; default `2`. |
 | `upstream.xai.inject-x-search` | boolean | Injects native `x_search` when absent from the request. |
-| `oauth.providers.devin.sensitive-words` | string array | Words obfuscated in system prompts/messages. |
+| `oauth.providers.devin.sensitive-words` | string array | Words used to strip matching lines in system prompts. |
+| `oauth.providers.devin.sensitive-words-replace` | object string to string | Target-to-replacement string map applied to system prompts (empty string deletes the matched phrase). |
+| `oauth.providers.devin.sensitive-patterns-replace` | array of `{pattern, replacement}` | Ordered Go RE2 regex replacements applied to system prompts (empty `replacement` deletes matches). |
 | `oauth.model-alias.*[].display-name` | string | Optional catalog display-name override. |
 | `multimedia.gpt-image-2-base-model` | string | Base model used for GPT Image 2 requests. |
 | `multimedia.video-result-auth-cache-ttl` | duration string | Video-result credential association lifetime. |
