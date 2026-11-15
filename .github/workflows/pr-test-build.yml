@@ -43,4 +43,10 @@ jobs:
       - name: Build
         run: |
           CGO_ENABLED=1 go build -o test-output ./cmd/home
-          rm -f test-output
+      - name: Verify real database interruption and recovery
+        env:
+          CLIPROXY_HOME_DISPOSABLE_POSTGRES: "1"
+        run: python3 cmd/home/database_recovery_test.py --postgres-container "${{ job.services.postgres.id }}" --home-binary ./test-output
+      - name: Remove test executable
+        if: always()
+        run: rm -f test-output
