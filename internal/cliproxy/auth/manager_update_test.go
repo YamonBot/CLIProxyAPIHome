@@ -354,6 +354,50 @@ func (s *blockingVersionedUpdateStore) snapshot() *Auth {
 	return s.persisted.Clone()
 }
 
+func TestManagerConcurrentPersistedVersionSnapshot(t *testing.T) {
+	auth := &Auth{
+		ID: "version-snapshot", Index: "version-snapshot-index", Provider: "codex",
+		Status: StatusActive, StateVersion: 1, Metadata: map[string]any{"fixture": true},
+	}
+	store := newBlockingVersionedUpdateStore(auth)
+	close(store.releaseFirst)
+	manager := NewManager(store, nil, nil)
+	manager.auths[auth.ID] = auth
+	manager.indexAuth[auth.Index] = auth
+	start := make(chan struct{})
+	var readers sync.WaitGroup
+	for _, read := range []func() (*Auth, bool){
+		func() (*Auth, bool) { return manager.GetByID(auth.ID) },
+		func() (*Auth, bool) { return manager.GetByIndex(auth.Index) },
+	} {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			<-start
+			for range 2000 {
+				snapshot, ok := read()
+				if !ok || snapshot == nil || snapshot.StateVersion < 1 {
+					t.Error("persisted version snapshot disappeared")
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	for range 2000 {
+		accepted, errPersist := manager.persistWithStore(t.Context(), store, auth, false)
+		if errPersist != nil || !accepted {
+			t.Errorf("persisted version publication: accepted=%v error=%v", accepted, errPersist)
+			break
+		}
+	}
+	readers.Wait()
+	snapshot, ok := manager.GetByID(auth.ID)
+	if !ok || snapshot.StateVersion != 2001 {
+		t.Fatalf("final snapshot = %#v, want version 2001", snapshot)
+	}
+}
+
 func TestManagerUpdateRejectsOlderStateVersion(t *testing.T) {
 	t.Parallel()
 

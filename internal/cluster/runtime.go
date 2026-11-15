@@ -15,7 +15,10 @@ import (
 	"gorm.io/gorm"
 )
 
-const homeConfigModelsMetadataKey = "home_config_models"
+const (
+	homeConfigModelsMetadataKey           = "home_config_models"
+	antigravityCapabilityHintsMetadataKey = "antigravity_capability_hints"
+)
 
 type RuntimeAdapter struct {
 	repo      *Repository
@@ -132,8 +135,14 @@ func (a *RuntimeAdapter) LoadConfigYAML(ctx context.Context) ([]byte, error) {
 
 // StoreUsagePayload stores an usage payload with its trusted Home receive time.
 func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error {
+	_, errStore := a.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
+	return errStore
+}
+
+// StoreUsagePayloadOutcome stores an usage payload and reports whether it was newly inserted.
+func (a *RuntimeAdapter) StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
 	if !a.Enabled() {
-		return fmt.Errorf("cluster runtime adapter is disabled")
+		return false, fmt.Errorf("cluster runtime adapter is disabled")
 	}
 	a.mu.RLock()
 	metadata := UsageRuntimeMetadata{
@@ -142,8 +151,8 @@ func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, 
 		ReceivedAt: receivedAt,
 	}
 	a.mu.RUnlock()
-	_, errAppend := a.repo.AppendUsageWithRuntime(ctx, payload, metadata)
-	return errAppend
+	_, inserted, errAppend := a.repo.AppendUsageWithRuntimeOutcome(ctx, payload, metadata)
+	return inserted, errAppend
 }
 
 // StoreAppLogPayload stores a CPA app log payload.
@@ -747,6 +756,7 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 		item.Status = auth.Status
 		item.Disabled = auth.Disabled
 		item.Unavailable = auth.Unavailable
+		item.ProxyURL = strings.TrimSpace(auth.ProxyURL)
 		item.RefreshBlocked = coreauth.RefreshBlocksDispatch(auth)
 		item.NextRetryAfter = auth.NextRetryAfter
 		item.Quota = auth.Quota
@@ -793,6 +803,7 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 		Status:                item.Status,
 		Disabled:              item.Disabled,
 		Unavailable:           item.Unavailable,
+		ProxyURL:              item.ProxyURL,
 		RuntimeProjection:     true,
 		RuntimeRefreshBlocked: item.RefreshBlocked,
 		NextRetryAfter:        item.NextRetryAfter,
@@ -810,9 +821,19 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 	if auth == nil {
 		return nil
 	}
-	metadata := make(map[string]any, 2)
+	metadata := make(map[string]any, 4)
 	if raw, ok := auth.Metadata[homeConfigModelsMetadataKey]; ok && raw != nil {
 		metadata[homeConfigModelsMetadataKey] = raw
+	}
+	if raw, ok := auth.Metadata[antigravityCapabilityHintsMetadataKey]; ok && raw != nil {
+		metadata[antigravityCapabilityHintsMetadataKey] = cloneMetadataValue(raw)
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		for _, key := range []string{"project_id", "base_url", "user_agent"} {
+			if s, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(s) != "" {
+				metadata[key] = strings.TrimSpace(s)
+			}
+		}
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		metadata["request_retry"] = requestRetry
@@ -853,9 +874,30 @@ func cloneModelMetadata(in map[string]any) map[string]any {
 	}
 	out := make(map[string]any, len(in))
 	for key, value := range in {
-		out[key] = value
+		out[key] = cloneMetadataValue(value)
 	}
 	return out
+}
+
+func cloneMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, v := range typed {
+			out[k] = cloneMetadataValue(v)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, v := range typed {
+			out[i] = cloneMetadataValue(v)
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return value
+	}
 }
 
 // cloneStringMap clones a string map.
