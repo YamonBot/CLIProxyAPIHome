@@ -524,9 +524,23 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
 		}
-		binding, errLoad := s.store.LoadSessionBinding(ctx, cacheKey)
+		bindingKey := cacheKey
+		binding, errLoad := s.store.LoadSessionBinding(ctx, bindingKey)
 		if errLoad != nil {
 			return nil, fmt.Errorf("load session affinity binding: %w", errLoad)
+		}
+		// Keep an existing provider-scoped binding during a rolling upgrade.
+		// New sessions use the native cross-provider key; existing sessions
+		// retain their original CAS authority until that binding expires.
+		if binding.Revision == "" && bindingScope != provider && provider != "mixed" {
+			previousKey := sessionBindingKey(provider, primaryID, model)
+			previous, errPrevious := s.store.LoadSessionBinding(ctx, previousKey)
+			if errPrevious != nil {
+				return nil, fmt.Errorf("load prior session affinity binding: %w", errPrevious)
+			}
+			if time.Now().Before(previous.ExpiresAt) {
+				bindingKey, binding = previousKey, previous
+			}
 		}
 		var selected *Auth
 		active := time.Now().Before(binding.ExpiresAt)
@@ -561,6 +575,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(bindingScope, fallbackID, model))
 			if errParent != nil {
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
+			}
+			if parent.Revision == "" && bindingScope != provider && provider != "mixed" {
+				parent, errParent = s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
+				if errParent != nil {
+					return nil, fmt.Errorf("load prior parent session affinity binding: %w", errParent)
+				}
 			}
 			if time.Now().Before(parent.ExpiresAt) {
 				for _, auth := range bindingCandidates {
@@ -598,7 +618,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 			return selected, nil
 		}
-		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
+		commit := SessionAffinityCommit{Key: bindingKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
 		if realProvider := sessionSelectionProvider(selected, provider); s.subagentAffinity && realProvider != "" && realProvider != "mixed" {
 			commit.SessionKey = sessionBindingKey("", primaryID, "")
 			commit.Provider = realProvider

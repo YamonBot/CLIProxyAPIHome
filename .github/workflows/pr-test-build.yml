@@ -38,6 +38,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify rolling-upgrade session affinity first
+        run: go test ./internal/cliproxy/auth -run '^TestSessionAffinity(RollingUpgrade|UpgradeDatabase)' -count=1
       - name: Verify transport, quota, cluster and management behavior
         run: go test ./internal/proxyutil ./internal/quota ./internal/cluster/... ./internal/respserver/... ./internal/cliproxy/auth ./internal/home ./cmd/home
       - name: Build
