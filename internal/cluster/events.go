@@ -2,8 +2,16 @@ package cluster
 
 import (
 	"context"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	log "github.com/sirupsen/logrus"
 )
 
 type EventWatcher struct {
@@ -69,6 +77,13 @@ func (w *EventWatcher) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			if errPoll := w.poll(ctx); errPoll != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				if retryableDatabaseConnectionError(errPoll) {
+					log.Warnf("cluster event database unavailable; retrying on next poll: %v", errPoll)
+					continue
+				}
 				return errPoll
 			}
 		}
@@ -106,4 +121,18 @@ func (w *EventWatcher) eventsAfter(ctx context.Context, id int64) ([]ClusterEven
 		return nil, errFind
 	}
 	return events, nil
+}
+
+// retryableDatabaseConnectionError recognizes connection loss during database failover.
+// Semantic errors, including incarnation fencing, must still stop the watcher.
+func retryableDatabaseConnectionError(err error) bool {
+	if errors.Is(err, ErrHomeIncarnationFenced) || errors.Is(err, ErrHomeIncarnationInactive) || errors.Is(err, ErrHomeIncarnationNotFound) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return strings.HasPrefix(pgErr.Code, "08") || pgErr.Code == "57P01" || pgErr.Code == "57P02" || pgErr.Code == "57P03"
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) || errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
