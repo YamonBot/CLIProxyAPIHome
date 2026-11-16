@@ -171,7 +171,11 @@ func (s *Server) syncClusterClientCount(ctx context.Context) {
 	if s == nil || s.cluster == nil {
 		return
 	}
-	if errSync := s.cluster.UpdateClientCount(ctx, node.GlobalRegistry().TotalCount()); errSync != nil {
+	// Statistics must not consume the subscription's independent heartbeat deadline.
+	// The coordinator's periodic heartbeat also persists the current client count.
+	updateCtx, cancelUpdate := context.WithTimeout(ctx, subscriptionHeartbeatInterval/2)
+	defer cancelUpdate()
+	if errSync := s.cluster.UpdateClientCount(updateCtx, node.GlobalRegistry().TotalCount()); errSync != nil {
 		log.Warnf("failed to sync cluster client count: %v", errSync)
 	}
 }

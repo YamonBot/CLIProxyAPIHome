@@ -278,8 +278,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 				c.setMaster(false)
 				return nil
 			}
-			incarnation, errHeartbeat := c.heartbeatHomeIncarnation(ctx)
-			if errHeartbeat != nil {
+			if errHeartbeat := c.refreshHeartbeat(ctx); errHeartbeat != nil {
 				c.setMaster(false)
 				if ctx.Err() != nil {
 					return nil
@@ -290,20 +289,26 @@ func (c *Coordinator) Start(ctx context.Context) error {
 				}
 				return errHeartbeat
 			}
-			if errBeat := c.heartbeatAndElect(ctx, incarnation); errBeat != nil {
-				c.setMaster(false)
-				if ctx.Err() != nil {
-					return nil
-				}
-				if retryableDatabaseConnectionError(errBeat) {
-					log.Warnf("cluster heartbeat database unavailable; retrying on next heartbeat: %v", errBeat)
-					continue
-				}
-				return errBeat
-			}
 			c.requestCPANodeSnapshotRefresh()
 		}
 	}
+}
+
+// refreshHeartbeat bounds election and pool/lock/commit waits to one heartbeat interval.
+// A slow election must not prevent the next liveness write and cause a healthy Home
+// to be expired by its peer. Genuine incarnation fencing remains terminal.
+func (c *Coordinator) refreshHeartbeat(ctx context.Context) error {
+	heartbeatCtx, cancelHeartbeat := context.WithTimeout(ctx, c.heartbeatInterval)
+	defer cancelHeartbeat()
+	incarnation, errHeartbeat := c.heartbeatHomeIncarnation(heartbeatCtx)
+	if errHeartbeat != nil {
+		return errors.Join(errHeartbeat, heartbeatCtx.Err())
+	}
+	errElection := c.heartbeatAndElect(heartbeatCtx, incarnation)
+	if errElection != nil {
+		return errors.Join(errElection, heartbeatCtx.Err())
+	}
+	return nil
 }
 
 func (c *Coordinator) runLifecycleCleanupLoop(ctx context.Context) {
