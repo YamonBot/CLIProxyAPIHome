@@ -123,11 +123,14 @@ func (w *EventWatcher) eventsAfter(ctx context.Context, id int64) ([]ClusterEven
 	return events, nil
 }
 
-// retryableDatabaseConnectionError recognizes connection loss during database failover.
+// retryableDatabaseConnectionError recognizes connection loss and bounded database waits.
 // Semantic errors, including incarnation fencing, must still stop the watcher.
 func retryableDatabaseConnectionError(err error) bool {
 	if errors.Is(err, ErrHomeIncarnationFenced) || errors.Is(err, ErrHomeIncarnationInactive) || errors.Is(err, ErrHomeIncarnationNotFound) {
 		return false
+	}
+	if IsLifecycleTimeout(err) {
+		return true
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

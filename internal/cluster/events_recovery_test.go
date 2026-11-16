@@ -17,8 +17,17 @@ import (
 )
 
 func TestEventWatcherRecoversDatabaseConnectionLoss(t *testing.T) {
-	for _, failureAt := range []string{"query", "callback"} {
-		t.Run(failureAt, func(t *testing.T) {
+	for _, failure := range []struct {
+		name string
+		at   string
+		err  error
+	}{
+		{"query connection", "query", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}},
+		{"callback connection", "callback", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}},
+		{"query lock timeout", "query", &pgconn.PgError{Code: "55P03"}},
+		{"callback lock timeout", "callback", &pgconn.PgError{Code: "55P03"}},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
 			db, errOpen := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "events.db"))
 			if errOpen != nil {
 				t.Fatal(errOpen)
@@ -35,11 +44,11 @@ func TestEventWatcherRecoversDatabaseConnectionLoss(t *testing.T) {
 			if errCreate := db.Create(&event).Error; errCreate != nil {
 				t.Fatal(errCreate)
 			}
-			connectionLost := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+			connectionLost := failure.err
 			queries := 0
 			if errRegister := db.Callback().Query().Before("gorm:query").Register("test:connection-loss", func(tx *gorm.DB) {
 				queries++
-				if failureAt == "query" && queries == 1 {
+				if failure.at == "query" && queries == 1 {
 					tx.AddError(connectionLost)
 				}
 			}); errRegister != nil {
@@ -53,7 +62,7 @@ func TestEventWatcherRecoversDatabaseConnectionLoss(t *testing.T) {
 				if got.ID != event.ID {
 					return fmt.Errorf("event changed: %d", got.ID)
 				}
-				if failureAt == "callback" && attempts == 1 {
+				if failure.at == "callback" && attempts == 1 {
 					return connectionLost
 				}
 				applied = true
@@ -66,7 +75,7 @@ func TestEventWatcherRecoversDatabaseConnectionLoss(t *testing.T) {
 			if !applied || watcher.lastSeenID != int64(event.ID) {
 				t.Fatalf("event not replayed after recovery: applied=%v cursor=%d", applied, watcher.lastSeenID)
 			}
-			if failureAt == "callback" && attempts != 2 {
+			if failure.at == "callback" && attempts != 2 {
 				t.Fatalf("callback attempts=%d, want 2", attempts)
 			}
 		})
@@ -86,11 +95,14 @@ func TestRetryableEventDatabaseErrorPreservesFatalErrors(t *testing.T) {
 		{"connection sqlstate", &pgconn.PgError{Code: "08006"}, true},
 		{"shutdown", &pgconn.PgError{Code: "57P01"}, true},
 		{"recovery", &pgconn.PgError{Code: "57P03"}, true},
+		{"lock timeout", &pgconn.PgError{Code: "55P03"}, true},
+		{"statement timeout", &pgconn.PgError{Code: "57014"}, true},
 		{"duplicate key", &pgconn.PgError{Code: "23505"}, false},
 		{"fenced", ErrHomeIncarnationFenced, false},
 		{"inactive", ErrHomeIncarnationInactive, false},
 		{"missing", ErrHomeIncarnationNotFound, false},
 		{"fence with connection error", errors.Join(ErrHomeIncarnationFenced, io.EOF), false},
+		{"fence with timeout", errors.Join(ErrHomeIncarnationFenced, &pgconn.PgError{Code: "55P03"}), false},
 		{"invalid event", errors.New("invalid CPA fence event"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
