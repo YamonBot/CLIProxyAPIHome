@@ -283,7 +283,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return nil
 				}
-				if retryableDatabaseConnectionError(errHeartbeat) {
+				if IsRetryableDatabaseError(errHeartbeat) {
 					log.Warnf("cluster heartbeat database unavailable; retrying on next heartbeat: %v", errHeartbeat)
 					continue
 				}

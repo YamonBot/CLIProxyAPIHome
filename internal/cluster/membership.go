@@ -112,16 +112,18 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
 			return errConfigure
 		}
+		// Hold shared validation locks while waiting for this CPA's membership.
+		// Policy/configuration writers still take UPDATE; unrelated CPAs may register.
 		gate := ConcurrencyActivationGateRecord{ID: 1}
 		if errCreate := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&gate).Error; errCreate != nil {
 			return errCreate
 		}
-		if errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&gate, "id = ?", 1).Error; errLock != nil {
+		if errLock := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).First(&gate, "id = ?", 1).Error; errLock != nil {
 			return errLock
 		}
 
 		lifecycle := LifecycleConfigRecord{}
-		if errLifecycle := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lifecycle, "id = ?", 1).Error; errLifecycle != nil {
+		if errLifecycle := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).First(&lifecycle, "id = ?", 1).Error; errLifecycle != nil {
 			return errLifecycle
 		}
 		cfg := config.CredentialConcurrencyConfig{}

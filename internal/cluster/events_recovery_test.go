@@ -99,6 +99,7 @@ func TestRetryableEventDatabaseErrorPreservesFatalErrors(t *testing.T) {
 		{"statement timeout", &pgconn.PgError{Code: "57014"}, true},
 		{"duplicate key", &pgconn.PgError{Code: "23505"}, false},
 		{"fenced", ErrHomeIncarnationFenced, false},
+		{"inactive membership with connection loss", errors.Join(ErrMembershipNotActive, io.EOF), false},
 		{"inactive", ErrHomeIncarnationInactive, false},
 		{"missing", ErrHomeIncarnationNotFound, false},
 		{"fence with connection error", errors.Join(ErrHomeIncarnationFenced, io.EOF), false},
@@ -106,7 +107,7 @@ func TestRetryableEventDatabaseErrorPreservesFatalErrors(t *testing.T) {
 		{"invalid event", errors.New("invalid CPA fence event"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := retryableDatabaseConnectionError(fmt.Errorf("wrapped: %w", tc.err)); got != tc.retry {
+			if got := IsRetryableDatabaseError(fmt.Errorf("wrapped: %w", tc.err)); got != tc.retry {
 				t.Fatalf("retry=%v, want %v", got, tc.retry)
 			}
 		})
