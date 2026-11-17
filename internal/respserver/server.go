@@ -204,10 +204,10 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedC
 					if runCtx.Err() != nil {
 						return
 					}
-					if cluster.IsLifecycleTimeout(errLiveness) {
+					if cluster.IsRetryableDatabaseError(errLiveness) {
 						// Tolerate transient waits only until the independent persistence deadline.
 						// Ordinary messages and telemetry never renew that deadline.
-						log.Warnf("subscription liveness refresh timed out; skipping heartbeat: %v", errLiveness)
+						log.Warnf("subscription liveness database unavailable; skipping heartbeat: %v", errLiveness)
 						continue
 					}
 					log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
@@ -670,9 +670,9 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 				if unsubscribeConfig != nil && !latencyPing {
 					lifetime := tracked.Lifetime()
 					if errLiveness := s.refreshSubscriptionLiveness(connectionCtx, lifetime, liveness); errLiveness != nil {
-						if cluster.IsLifecycleTimeout(errLiveness) {
+						if cluster.IsRetryableDatabaseError(errLiveness) {
 							// The independent watchdog still fences at the last persisted heartbeat's deadline.
-							log.Warnf("subscription liveness refresh timed out; skipping PING reply: %v", errLiveness)
+							log.Warnf("subscription liveness database unavailable; skipping PING reply: %v", errLiveness)
 							return
 						}
 						log.Warnf("failed to refresh subscription liveness: %v", errLiveness)

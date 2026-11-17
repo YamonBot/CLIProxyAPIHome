@@ -3,6 +3,7 @@ package respserver
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,7 +24,7 @@ func (h *deadlineLivenessHandler) RefreshCPALiveness(ctx context.Context, _ clus
 }
 
 func TestSubscriptionLivenessExpiresDespiteOrdinaryTraffic(t *testing.T) {
-	for _, mode := range []string{"periodic timeout", "PING timeout", "blocked database"} {
+	for _, mode := range []string{"periodic timeout", "PING timeout", "blocked database", "connection lost"} {
 		t.Run(mode, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				commands := [][]string{{"SUBSCRIBE", "config"}}
@@ -40,6 +41,9 @@ func TestSubscriptionLivenessExpiresDespiteOrdinaryTraffic(t *testing.T) {
 					blockingClusterHandler: blockingClusterHandler{lifetime: lifetime},
 					refresh: func(ctx context.Context) error {
 						refreshes.Add(1)
+						if mode == "connection lost" {
+							return io.EOF
+						}
 						if mode == "blocked database" {
 							<-ctx.Done()
 							return ctx.Err()
@@ -150,7 +154,7 @@ func TestSubscriptionLivenessRecoversBeforePersistenceDeadline(t *testing.T) {
 		var refreshes atomic.Int32
 		server.SetClusterHandler(&deadlineLivenessHandler{refresh: func(context.Context) error {
 			if refreshes.Add(1) <= 3 {
-				return &pgconn.PgError{Code: "55P03"}
+				return io.EOF
 			}
 			return nil
 		}})

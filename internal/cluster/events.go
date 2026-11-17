@@ -80,7 +80,7 @@ func (w *EventWatcher) Start(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return nil
 				}
-				if retryableDatabaseConnectionError(errPoll) {
+				if IsRetryableDatabaseError(errPoll) {
 					log.Warnf("cluster event database unavailable; retrying on next poll: %v", errPoll)
 					continue
 				}
@@ -123,10 +123,10 @@ func (w *EventWatcher) eventsAfter(ctx context.Context, id int64) ([]ClusterEven
 	return events, nil
 }
 
-// retryableDatabaseConnectionError recognizes connection loss and bounded database waits.
-// Semantic errors, including incarnation fencing, must still stop the watcher.
-func retryableDatabaseConnectionError(err error) bool {
-	if errors.Is(err, ErrHomeIncarnationFenced) || errors.Is(err, ErrHomeIncarnationInactive) || errors.Is(err, ErrHomeIncarnationNotFound) {
+// IsRetryableDatabaseError recognizes connection loss and bounded database waits.
+// Semantic errors, including incarnation fencing, remain terminal for watchers and subscription heartbeats.
+func IsRetryableDatabaseError(err error) bool {
+	if errors.Is(err, ErrMembershipNotActive) || errors.Is(err, ErrHomeIncarnationFenced) || errors.Is(err, ErrHomeIncarnationInactive) || errors.Is(err, ErrHomeIncarnationNotFound) {
 		return false
 	}
 	if IsLifecycleTimeout(err) {
