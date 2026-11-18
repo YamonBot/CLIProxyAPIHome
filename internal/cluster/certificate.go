@@ -151,15 +151,23 @@ func (r *Repository) ClusterCAKeyPair(ctx context.Context) (*x509.Certificate, *
 	return cert, key, nil
 }
 
-// CurrentMasterNode returns the current master node if one is recorded.
+// CurrentMasterNode returns the recorded master while its heartbeat is live.
 func (r *Repository) CurrentMasterNode(ctx context.Context) (*ClusterNodeRecord, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
 	}
+	timeout, errTimeout := r.lifecycleConfigNodeHeartbeatTimeout(ctx)
+	if errTimeout != nil {
+		return nil, errTimeout
+	}
+	now, errNow := DatabaseNow(ctx, db)
+	if errNow != nil {
+		return nil, errNow
+	}
 	record := &ClusterNodeRecord{}
 	errFirst := db.WithContext(contextOrBackground(ctx)).
-		Where("is_master = ?", true).
+		Where("is_master = ? AND last_seen_at >= ?", true, now.Add(-timeout)).
 		Order("last_seen_at DESC, started_at ASC, ip ASC, port ASC").
 		First(record).Error
 	if errFirst == nil {
