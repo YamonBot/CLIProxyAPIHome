@@ -68,6 +68,11 @@ func (h *Handler) certificateJWTTarget(ctx context.Context) (string, int) {
 	}
 	ip := strings.TrimSpace(h.nodeIP)
 	port := h.nodePort
+	// The responding Home can enroll clients without waiting for master election
+	// or relying on another node's heartbeat surviving a rolling update.
+	if ip != "" && port > 0 {
+		return ip, port
+	}
 	if h.repo == nil {
 		return ip, port
 	}

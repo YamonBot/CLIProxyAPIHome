@@ -14,14 +14,20 @@ import (
 
 func TestCertificateBootstrapUsesLiveTarget(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		masterAge time.Duration
-		master    bool
-		wantIP    string
+		name          string
+		masterAge     time.Duration
+		master        bool
+		masterRetired bool
+		issuerIP      string
+		issuerPort    int
+		wantIP        string
 	}{
-		{name: "rolling update stale master falls back to issuer", master: true, masterAge: 2 * time.Minute, wantIP: "10.52.0.101"},
-		{name: "healthy master retains preference", master: true, wantIP: "10.52.0.100"},
-		{name: "no elected master uses issuer", wantIP: "10.52.0.101"},
+		{name: "rolling update stale master uses issuer", master: true, masterAge: 2 * time.Minute, issuerIP: "10.52.0.101", issuerPort: 8327, wantIP: "10.52.0.101"},
+		{name: "recently live retired master uses responding issuer", master: true, masterRetired: true, issuerIP: "10.52.0.101", issuerPort: 8327, wantIP: "10.52.0.101"},
+		{name: "healthy master does not override issuer", master: true, issuerIP: " 10.52.0.101 ", issuerPort: 8327, wantIP: "10.52.0.101"},
+		{name: "no elected master uses issuer", issuerIP: "10.52.0.101", issuerPort: 8327, wantIP: "10.52.0.101"},
+		{name: "missing issuer IP falls back to live master", master: true, issuerIP: " ", issuerPort: 8327, wantIP: "10.52.0.100"},
+		{name: "invalid issuer port falls back to live master", master: true, issuerIP: "10.52.0.101", wantIP: "10.52.0.100"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db, cleanup := openManagementLogTestDB(t)
@@ -44,7 +50,16 @@ func TestCertificateBootstrapUsesLiveTarget(t *testing.T) {
 					t.Fatal(errCreate)
 				}
 			}
-			handler := NewHandler(repo, nil, "10.52.0.101", 8327)
+			if test.masterRetired {
+				retired := cluster.HomeProcessIncarnationRecord{
+					HomeIP: "10.52.0.100", HomePort: 8327, StartedAt: now.Add(-time.Hour),
+					LastSeenAt: now, State: cluster.HomeIncarnationRetired, Capabilities: cluster.JSONB(`[]`),
+				}
+				if errCreate := db.Create(&retired).Error; errCreate != nil {
+					t.Fatal(errCreate)
+				}
+			}
+			handler := NewHandler(repo, nil, test.issuerIP, test.issuerPort)
 			engine := gin.New()
 			engine.POST("/certificates/clients", handler.CreateClientCertificate)
 			response := httptest.NewRecorder()
