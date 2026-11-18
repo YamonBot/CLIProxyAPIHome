@@ -34,6 +34,31 @@ func recordQuiescenceLock(ctx context.Context, step string) {
 	}
 }
 
+var errCancellationEventBusy = errors.New("CPA cancellation event publisher is busy")
+
+// withFingerprintCancellationTransaction retries publication only after rolling
+// back all lifecycle locks. Waiting first with the event lock held would invert
+// the Home-before-event ordering used by configuration and policy writers.
+func withFingerprintCancellationTransaction(ctx context.Context, db *gorm.DB, fn func(*gorm.DB) error) error {
+	for {
+		errTransaction := db.WithContext(ctx).Transaction(fn)
+		if !errors.Is(errTransaction, errCancellationEventBusy) {
+			return errTransaction
+		}
+		// Keep the caller's existing lifecycle budget and PostgreSQL local timeouts.
+		// This transaction holds only the publication lock, and releases it before
+		// retrying the complete membership and generation validation.
+		if errWait := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+				return errConfigure
+			}
+			return lockClusterEventTransaction(tx)
+		}); errWait != nil {
+			return errWait
+		}
+	}
+}
+
 // BeginFingerprintCancellation creates the exact Home acknowledgement set for an active membership.
 func (r *Repository) BeginFingerprintCancellation(ctx context.Context, fingerprint string) (int64, error) {
 	db, errDB := r.database()
@@ -48,7 +73,7 @@ func (r *Repository) BeginFingerprintCancellation(ctx context.Context, fingerpri
 	ctx, cancel := lifecycleTransactionContext(ctx)
 	defer cancel()
 	var revision int64
-	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	errTransaction := withFingerprintCancellationTransaction(ctx, db, func(tx *gorm.DB) error {
 		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
 			return errConfigure
 		}
@@ -74,7 +99,7 @@ func (r *Repository) BeginFingerprintCancellationForLifetime(ctx context.Context
 	ctx, cancel := lifecycleTransactionContext(ctx)
 	defer cancel()
 	var revision int64
-	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	errTransaction := withFingerprintCancellationTransaction(ctx, db, func(tx *gorm.DB) error {
 		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
 			return errConfigure
 		}
@@ -147,6 +172,17 @@ func beginFingerprintCancellationForMembershipTx(ctx context.Context, tx *gorm.D
 	if errResolve := resolveQuiescenceHomeEligibilityTx(ctx, tx, rows, lifecycle, now); errResolve != nil {
 		return 0, errResolve
 	}
+	// Never wait for a global publisher while retaining a membership fence.
+	// A busy publisher rolls this transaction back; the retry waits without rows.
+	if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+		var acquired bool
+		if errLock := tx.Raw("SELECT pg_try_advisory_xact_lock(?)", clusterEventAdvisoryLockKey).Scan(&acquired).Error; errLock != nil {
+			return 0, errLock
+		}
+		if !acquired {
+			return 0, errCancellationEventBusy
+		}
+	}
 	if errEvent := appendEvent(tx, "cpa-fence", membership.ConnectedAt.UTC().Format(time.RFC3339Nano), membership.CertificateFingerprint, revision); errEvent != nil {
 		return 0, errEvent
 	}
@@ -194,7 +230,7 @@ func (r *Repository) cleanupStaleMembership(ctx context.Context, fingerprint str
 	}
 	ctx, cancel := lifecycleTransactionContext(ctx)
 	defer cancel()
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return withFingerprintCancellationTransaction(ctx, db, func(tx *gorm.DB) error {
 		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
 			return errConfigure
 		}
