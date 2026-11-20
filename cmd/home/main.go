@@ -679,7 +679,7 @@ func openRuntimeDatabase(ctx context.Context, clusterCfg *cluster.Config, cluste
 			db, errOpenSQLite := cluster.OpenSQLite(ctx, resolveSQLitePath(sqlitePath, clusterCfg.SQLite.Path), clusterCfg.SQLite.SlowQueryThreshold)
 			return db, cluster.DatabaseBackendSQLite, errOpenSQLite
 		case cluster.DatabaseBackendPostgres:
-			db, errOpenPostgres := cluster.Open(ctx, clusterCfg.PGSQL)
+			db, errOpenPostgres := openPostgresDatabaseWithRetry(ctx, clusterCfg.PGSQL)
 			return db, cluster.DatabaseBackendPostgres, errOpenPostgres
 		default:
 			return nil, "", fmt.Errorf("unsupported database backend %q", clusterCfg.DatabaseBackend())
@@ -687,6 +687,36 @@ func openRuntimeDatabase(ctx context.Context, clusterCfg *cluster.Config, cluste
 	}
 	db, errOpenSQLite := cluster.OpenSQLite(ctx, resolveSQLitePath(sqlitePath, ""))
 	return db, cluster.DatabaseBackendSQLite, errOpenSQLite
+}
+
+const (
+	runtimeDatabaseOpenRetryBudget   = 10 * time.Minute
+	runtimeDatabaseOpenRetryInterval = 3 * time.Second
+)
+
+// openPostgresDatabaseWithRetry retries cluster.Open against Postgres for
+// up to runtimeDatabaseOpenRetryBudget, honoring context cancellation.
+func openPostgresDatabaseWithRetry(ctx context.Context, cfg cluster.PGSQLConfig) (*gorm.DB, error) {
+	retryCtx, cancelRetry := context.WithTimeout(ctx, runtimeDatabaseOpenRetryBudget)
+	defer cancelRetry()
+	for attempt := 1; ; attempt++ {
+		db, errOpen := cluster.Open(retryCtx, cfg)
+		if errOpen == nil {
+			return db, nil
+		}
+		if retryCtx.Err() == nil {
+			log.Warnf("database open attempt %d failed (retrying for %s): %v", attempt, runtimeDatabaseOpenRetryBudget, errOpen)
+			select {
+			case <-retryCtx.Done():
+			case <-time.After(runtimeDatabaseOpenRetryInterval):
+				continue
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("database open retry canceled: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("database open retry budget exhausted after %d attempts: %w", attempt, retryCtx.Err())
+	}
 }
 
 // resolveDatabaseNodeConfig resolves coordinator and watcher timing settings.
