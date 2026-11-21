@@ -78,7 +78,10 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	if cfg.MaxIdleConns != nil {
 		sqlDB.SetMaxIdleConns(*cfg.MaxIdleConns)
 	}
-	db, errOpen := gorm.Open(postgres.New(postgres.Config{DSN: dsn, Conn: sqlDB}), databaseGORMConfig(cfg.SlowQueryThreshold))
+	gormCfg := databaseGORMConfig(cfg.SlowQueryThreshold)
+	// The explicit PingContext below owns startup connectivity and its deadline.
+	gormCfg.DisableAutomaticPing = true
+	db, errOpen := gorm.Open(postgres.New(postgres.Config{DSN: dsn, Conn: sqlDB}), gormCfg)
 	if errOpen != nil {
 		if errClose := sqlDB.Close(); errClose != nil {
 			return nil, fmt.Errorf("open postgres: %w; close sql db: %v", errOpen, errClose)

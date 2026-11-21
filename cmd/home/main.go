@@ -719,23 +719,25 @@ const (
 // openPostgresDatabaseWithRetry retries cluster.Open against Postgres for
 // up to runtimeDatabaseOpenRetryBudget, honoring context cancellation.
 func openPostgresDatabaseWithRetry(ctx context.Context, cfg cluster.PGSQLConfig) (*gorm.DB, error) {
-	deadline := time.Now().Add(runtimeDatabaseOpenRetryBudget)
+	retryCtx, cancel := context.WithTimeout(ctx, runtimeDatabaseOpenRetryBudget)
+	defer cancel()
 	for attempt := 1; ; attempt++ {
-		db, errOpen := cluster.Open(ctx, cfg)
+		db, errOpen := cluster.Open(retryCtx, cfg)
 		if errOpen == nil {
 			return db, nil
 		}
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("database open retry canceled: %w", errOpen)
+		if retryCtx.Err() == nil {
+			log.Warnf("database open attempt %d failed (retrying for %s): %v", attempt, runtimeDatabaseOpenRetryBudget, errOpen)
+			select {
+			case <-retryCtx.Done():
+			case <-time.After(runtimeDatabaseOpenRetryInterval):
+			}
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("database open retry budget exhausted after %d attempts: %w", attempt, errOpen)
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, fmt.Errorf("database open retry canceled: %w", errors.Join(errOpen, errContext))
 		}
-		log.Warnf("database open attempt %d failed (retrying for %s): %v", attempt, runtimeDatabaseOpenRetryBudget, errOpen)
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("database open retry canceled: %w", errOpen)
-		case <-time.After(runtimeDatabaseOpenRetryInterval):
+		if errBudget := retryCtx.Err(); errBudget != nil {
+			return nil, fmt.Errorf("database open retry budget exhausted after %d attempts: %w", attempt, errors.Join(errOpen, errBudget))
 		}
 	}
 }

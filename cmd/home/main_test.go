@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -714,6 +715,46 @@ func TestDatabaseSnapshotResolveRuntimeDatabaseBackend(t *testing.T) {
 	postgresConfig := &cluster.Config{PGSQL: cluster.PGSQLConfig{Host: "postgres"}}
 	if got := resolveRuntimeDatabaseBackend(postgresConfig, true); got != cluster.DatabaseBackendPostgres {
 		t.Fatalf("cluster backend = %q, want postgres", got)
+	}
+}
+
+func TestPostgresStartupCancellationInterruptsHandshake(t *testing.T) {
+	t.Parallel()
+
+	listener, errListen := net.Listen("tcp4", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatal(errListen)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	tcpListener := listener.(*net.TCPListener)
+	if errDeadline := tcpListener.SetDeadline(time.Now().Add(3 * time.Second)); errDeadline != nil {
+		t.Fatal(errDeadline)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errs := make(chan error, 1)
+	go func() {
+		_, errOpen := openPostgresDatabaseWithRetry(ctx, cluster.PGSQLConfig{
+			PostgresURI: "postgres://home@" + listener.Addr().String() + "/home?sslmode=disable",
+		})
+		errs <- errOpen
+	}()
+	conn, errAccept := listener.Accept()
+	if errAccept != nil {
+		t.Fatal(errAccept)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	// Keep the connection open without sending a PostgreSQL handshake reply.
+	cancel()
+
+	select {
+	case errOpen := <-errs:
+		if !errors.Is(errOpen, context.Canceled) {
+			t.Fatalf("openPostgresDatabaseWithRetry() error = %v, want context canceled", errOpen)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup ignored cancellation during the PostgreSQL handshake")
 	}
 }
 
